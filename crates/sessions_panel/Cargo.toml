@@ -1,0 +1,22 @@
+[package]
+name = "sessions_panel"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lib]
+path = "src/sessions_panel.rs"
+
+[dependencies]
+anyhow.workspace = true
+db.workspace = true
+gpui.workspace = true
+project.workspace = true
+settings.workspace = true
+terminal.workspace = true
+terminal_view.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+zed_actions.workspace = true
