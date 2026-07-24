@@ -1,3 +1,7 @@
+// hive: init(...) is no longer called from main.rs (edit prediction stripped);
+// module kept compiling per task brief, hence the blanket dead_code allow.
+#![allow(dead_code)]
+
 use client::{Client, UserStore};
 use codestral::{CodestralEditPredictionDelegate, load_codestral_api_key};
 use collections::HashMap;

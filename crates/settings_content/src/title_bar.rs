@@ -109,11 +109,11 @@ pub struct TitleBarSettingsContent {
     pub show_project_items: Option<bool>,
     /// Whether to show the sign in button in the title bar.
     ///
-    /// Default: true
+    /// Default: false
     pub show_sign_in: Option<bool>,
     /// Whether to show the user menu button in the title bar.
     ///
-    /// Default: true
+    /// Default: false
     pub show_user_menu: Option<bool>,
     /// Whether to show the menus in the title bar.
     ///

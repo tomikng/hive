@@ -27,6 +27,9 @@ use zed_actions::ShowCallStats;
 
 use crate::TitleBar;
 
+// hive: dead code below only because render_call_controls is no longer called
+// (title_bar.rs) — call controls are stripped, this crate stays intact per task brief.
+#[allow(dead_code)]
 fn format_stat(value: Option<f64>, format: impl Fn(f64) -> String) -> String {
     match value {
         Some(v) => format(v),
@@ -333,6 +336,8 @@ impl TitleBar {
         )
     }
 
+    // hive: no longer called from title_bar.rs (call controls stripped from title bar).
+    #[allow(dead_code)]
     pub(crate) fn render_call_controls(
         &self,
         window: &mut Window,
@@ -686,6 +691,8 @@ impl TitleBar {
             .into_any_element()
     }
 
+    // hive: only reachable from render_call_controls, which is stripped.
+    #[allow(dead_code)]
     fn render_screen_list(&self) -> impl IntoElement {
         PopoverMenu::new("screen-share-screen-list")
             .with_handle(self.screen_share_popover_handle.clone())
@@ -763,6 +770,8 @@ impl TitleBar {
 }
 
 /// Picks the screen to share when clicking on the main screen sharing button.
+// hive: only reachable from render_call_controls, which is stripped.
+#[allow(dead_code)]
 fn pick_default_screen(cx: &App) -> Task<anyhow::Result<Option<Rc<dyn ScreenCaptureSource>>>> {
     let source = cx.screen_capture_sources();
     cx.spawn(async move |_| {

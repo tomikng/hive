@@ -205,6 +205,8 @@ pub struct TitleBar {
     _subscriptions: Vec<Subscription>,
     banner: Option<Entity<OnboardingBanner>>,
     update_version: Entity<UpdateVersion>,
+    // hive: only read by render_screen_list, which is stripped along with render_call_controls.
+    #[allow(dead_code)]
     screen_share_popover_handle: PopoverMenuHandle<ContextMenu>,
     _diagnostics_subscription: Option<gpui::Subscription>,
 }
@@ -363,7 +365,7 @@ impl Render for TitleBar {
                 .pr_1()
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(self.render_call_controls(window, cx))
+                // hive: stripped render_call_controls child
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
                 .when(
@@ -1134,6 +1136,8 @@ impl TitleBar {
         }
     }
 
+    // hive: only reachable from render_call_controls, which is stripped.
+    #[allow(dead_code)]
     fn share_project(&mut self, cx: &mut Context<Self>) {
         let active_call = ActiveCall::global(cx);
         let project = self.project.clone();
@@ -1142,6 +1146,8 @@ impl TitleBar {
             .detach_and_log_err(cx);
     }
 
+    // hive: only reachable from render_call_controls, which is stripped.
+    #[allow(dead_code)]
     fn unshare_project(&mut self, _: &mut Window, cx: &mut Context<Self>) {
         let active_call = ActiveCall::global(cx);
         let project = self.project.clone();
