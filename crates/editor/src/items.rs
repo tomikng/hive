@@ -46,7 +46,8 @@ use ui::{IconDecorationKind, prelude::*};
 use util::{ResultExt, TryFutureExt, debug_panic, paths::PathExt, rel_path::RelPath};
 use workspace::item::{Dedup, ItemSettings, SerializableItem, TabContentParams};
 use workspace::{
-    CollaboratorId, ItemId, ItemNavHistory, ToolbarItemLocation, ViewId, Workspace, WorkspaceId,
+    CollaboratorId, ItemId, ItemNavHistory, SplitDirection, ToolbarItemLocation, ViewId,
+    Workspace, WorkspaceId,
     invalid_item_view::InvalidItemView,
     item::{FollowableItem, Item, ItemBufferKind, ItemEvent, ProjectItem, SaveOptions},
     searchable::{
@@ -2108,39 +2109,43 @@ pub async fn open_resolved_target(
     cx: &mut AsyncWindowContext,
 ) -> Result<bool> {
     let path_to_open = open_target.path();
-    let mut opened_items = workspace
-        .update_in(cx, |workspace, window, cx| {
-            workspace.open_paths(
-                vec![path_to_open.path.clone()],
-                workspace::OpenOptions {
-                    visible: Some(workspace::OpenVisible::OnlyDirectories),
-                    ..Default::default()
-                },
-                None,
-                window,
-                cx,
-            )
-        })
-        .context("workspace update")?
-        .await;
-    if opened_items.len() != 1 {
-        debug_panic!(
-            "Received {} items for one path {path_to_open:?}",
-            opened_items.len(),
-        );
-    }
-    let Some(opened_item) = opened_items.pop() else {
-        return Ok(false);
-    };
 
     if open_target.is_file() {
-        let Some(opened_item) = opened_item else {
-            return Ok(false);
-        };
-        let opened_item =
-            opened_item.with_context(|| format!("opening {:?}", path_to_open.path))?;
+        // `OnlyDirectories` visibility (i.e. `visible: false` here) matches the prior
+        // `open_paths` behavior for files: a path outside any worktree is added as an
+        // invisible single-file worktree rather than a visible project root.
+        let (_worktree, project_path) = workspace
+            .update(cx, |workspace, cx| {
+                Workspace::project_path_for_path(
+                    workspace.project().clone(),
+                    &path_to_open.path,
+                    false,
+                    cx,
+                )
+            })
+            .context("workspace update")?
+            .await
+            .with_context(|| format!("resolving project path for {:?}", path_to_open.path))?;
+
+        // `split_path_preview` always opens in a new split to the right of the terminal
+        // (unless the center pane is empty), so a file already open elsewhere gets a second,
+        // split-local tab rather than being reused/focused in place. Acceptable for Phase 2.
+        let item = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.split_path_preview(
+                    project_path,
+                    false,
+                    Some(SplitDirection::Right),
+                    window,
+                    cx,
+                )
+            })
+            .context("workspace update")?
+            .await
+            .with_context(|| format!("opening {:?}", path_to_open.path))?;
+
         if let Some(row) = path_to_open.row
-            && let Some(editor) = opened_item.downcast::<Editor>()
+            && let Some(editor) = item.downcast::<Editor>()
         {
             let column = path_to_open.column.unwrap_or(0);
             editor
@@ -2158,6 +2163,29 @@ pub async fn open_resolved_target(
         }
         Ok(true)
     } else if open_target.is_dir() {
+        let mut opened_items = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_paths(
+                    vec![path_to_open.path.clone()],
+                    workspace::OpenOptions {
+                        visible: Some(workspace::OpenVisible::OnlyDirectories),
+                        ..Default::default()
+                    },
+                    None,
+                    window,
+                    cx,
+                )
+            })
+            .context("workspace update")?
+            .await;
+        if opened_items.len() != 1 {
+            debug_panic!(
+                "Received {} items for one path {path_to_open:?}",
+                opened_items.len(),
+            );
+        }
+        opened_items.pop();
+
         workspace.update(cx, |workspace, cx| {
             workspace.project().update(cx, |_, cx| {
                 cx.emit(project::Event::ActivateProjectPanel);
