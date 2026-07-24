@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use gpui::{
     App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Rems, SharedString,
-    Subscription, Task, TaskExt, Window, actions, rems,
+    Subscription, Task, TaskExt, WeakEntity, Window, actions, rems,
 };
 use picker::{Picker, PickerDelegate};
 use project::git_store::Repository;
@@ -19,11 +19,9 @@ actions!(
     ]
 );
 
-/// Called with the confirmed row when the user selects a PR/MR.
-///
-/// Task 3 (PR detail view) hooks in here: pass `Some(callback)` to `open_with`
-/// (or a similar entry point) to open the detail view for the selected PR
-/// instead of just dismissing the list.
+/// Called with the confirmed row when the user selects a PR/MR. `PrList::new`
+/// builds this once it knows the `Forge` for the active repository, wiring it
+/// to `detail::open_pr`.
 pub type OnSelectPr = Arc<dyn Fn(&PrSummary, &mut Window, &mut App)>;
 
 pub fn register(workspace: &mut Workspace) {
@@ -34,8 +32,9 @@ pub fn register(workspace: &mut Workspace) {
 
 pub fn open(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
     let repository = workspace.project().read(cx).active_repository(cx);
+    let workspace_handle = cx.weak_entity();
     workspace.toggle_modal(window, cx, |window, cx| {
-        PrList::new(repository, None, rems(34.), window, cx)
+        PrList::new(repository, workspace_handle, rems(34.), window, cx)
     })
 }
 
@@ -56,11 +55,19 @@ pub struct PrList {
 impl PrList {
     fn new(
         repository: Option<Entity<Repository>>,
-        on_select: Option<OnSelectPr>,
+        workspace: WeakEntity<Workspace>,
         width: Rems,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let forge = repository.as_ref().and_then(|repo| forge::detect(repo, cx));
+
+        let on_select: Option<OnSelectPr> = forge.clone().map(|forge| {
+            Arc::new(move |pr: &PrSummary, window: &mut Window, cx: &mut App| {
+                crate::detail::open_pr(forge.clone(), pr.clone(), workspace.clone(), window, cx);
+            }) as OnSelectPr
+        });
+
         let delegate = PrListDelegate::new(on_select, window, cx);
         let picker = cx.new(|cx| {
             Picker::uniform_list(delegate, window, cx)
@@ -84,15 +91,7 @@ impl PrList {
             _subscriptions: subscriptions,
         };
 
-        let Some(repository) = repository else {
-            this.picker.update(cx, |picker, cx| {
-                picker.delegate.state = PrListState::NoForgeDetected;
-                cx.notify();
-            });
-            return this;
-        };
-
-        let Some(forge) = forge::detect(&repository, cx) else {
+        let Some(forge) = forge else {
             this.picker.update(cx, |picker, cx| {
                 picker.delegate.state = PrListState::NoForgeDetected;
                 cx.notify();

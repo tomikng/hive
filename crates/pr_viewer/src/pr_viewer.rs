@@ -1,3 +1,4 @@
+pub mod detail;
 pub mod forge;
 pub mod list;
 

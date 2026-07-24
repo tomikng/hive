@@ -13945,12 +13945,15 @@ name = "pr_viewer"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "editor",
+ "futures 0.3.32",
  "git",
  "gpui",
  "picker",
  "project",
  "serde",
  "serde_json",
+ "theme",
  "ui",
  "util",
  "workspace",

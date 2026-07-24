@@ -162,7 +162,9 @@ struct GhAuthor {
 struct GhPullRequest {
     number: u32,
     title: String,
-    author: GhAuthor,
+    // Deleted GitHub accounts report `"author": null`; tolerate it so one
+    // bad row doesn't fail the whole list parse.
+    author: Option<GhAuthor>,
     state: String,
     url: String,
 }
@@ -179,7 +181,10 @@ fn parse_gh_pr_list(stdout: &str) -> Result<Vec<PrSummary>, ListPrsError> {
         .map(|entry| PrSummary {
             number: entry.number,
             title: entry.title,
-            author: entry.author.login,
+            author: entry
+                .author
+                .map(|author| author.login)
+                .unwrap_or_else(|| "unknown".to_string()),
             state: entry.state,
             url: entry.url,
         })
@@ -274,6 +279,30 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_gh_pr_list_with_null_author() {
+        // A deleted GitHub account reports `"author": null`; one bad row
+        // must not blank the whole list.
+        const SAMPLE: &str = r#"[
+            {
+                "number": 42,
+                "title": "Add PR viewer",
+                "author": null,
+                "state": "OPEN",
+                "url": "https://github.com/zed-industries/zed/pull/42"
+            }
+        ]"#;
+
+        let prs = parse_gh_pr_list(SAMPLE).expect("null author should not fail the parse");
+        assert_eq!(prs, vec![PrSummary {
+            number: 42,
+            title: "Add PR viewer".into(),
+            author: "unknown".into(),
+            state: "OPEN".into(),
+            url: "https://github.com/zed-industries/zed/pull/42".into(),
+        }]);
     }
 
     #[test]
