@@ -746,8 +746,14 @@ fn main() {
         theme_selector::init(cx);
         settings_profile_selector::init(cx);
         language_tools::init(cx);
-        // hive: stripped call::init(...)
+        // hive: collab_ui::init stays stripped, but the title bar (project/branch) is kept.
+        // title_bar::init lazily builds TitleBar on workspace creation, and TitleBar::new calls
+        // ActiveCall::global (try_global().unwrap()), so call::init must run first to set that
+        // global. call::init only registers the ActiveCall global; with channel/collab_ui stripped
+        // it stays unused and shows no collab UI.
+        call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+        title_bar::init(cx);
         // hive: stripped collab_ui::init(...)
         git_ui::init(cx);
         feedback::init(cx);
