@@ -753,6 +753,11 @@
       "cmd-shift-e": "project_panel::ToggleFocus",
       "cmd-shift-b": "outline_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
+      // Hive: git_panel::ActivateHistoryTab (cmd-2 within GitPanel) and stash
+      // sub-actions were already bound; git graph and stash viewer had no
+      // binding anywhere, so surface them globally here.
+      "ctrl-shift-h": "git_graph::Open",
+      "ctrl-shift-s": "git::ViewStash",
       "cmd-shift-d": "debug_panel::ToggleFocus",
       "cmd-?": "agent::ToggleFocus",
       "cmd-alt-s": "workspace::SaveAll",
