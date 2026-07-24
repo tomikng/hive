@@ -30,6 +30,9 @@ gpui.workspace = true
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true
+# Matches the `polling` version used by the vendored `alacritty_terminal`, so
+# `TeePty` can name `polling::{Poller, Event, PollMode}` in its `EventedReadWrite` impl.
+polling = "3.8.0"
 regex.workspace = true
 release_channel.workspace = true
 schemars.workspace = true

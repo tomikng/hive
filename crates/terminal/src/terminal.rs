@@ -747,6 +747,12 @@ pub(crate) enum TerminalBackendEvent {
     Bell,
     Exit,
     ChildExit(ExitStatus),
+    /// An OSC 133 semantic-prompt marker captured from the raw PTY stream.
+    /// `kind` is `A`/`B`/`C`/`D`; `exit_code` is only present for `D`.
+    SemanticPrompt {
+        kind: char,
+        exit_code: Option<i32>,
+    },
 }
 
 impl fmt::Debug for TerminalBackendEvent {
@@ -765,6 +771,9 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::Bell => f.write_str("Bell"),
             Self::Exit => f.write_str("Exit"),
             Self::ChildExit(status) => write!(f, "ChildExit({status})"),
+            Self::SemanticPrompt { kind, exit_code } => {
+                write!(f, "SemanticPrompt({kind}, {exit_code:?})")
+            }
         }
     }
 }
@@ -1651,6 +1660,11 @@ impl Terminal {
             }
             TerminalBackendEvent::ChildExit(exit_status) => {
                 self.register_task_finished(Some(exit_status), cx);
+            }
+            TerminalBackendEvent::SemanticPrompt { kind, exit_code } => {
+                // Spike: prove OSC 133 capture reaches Zed. Tasks 3-4 will build
+                // the command-boundary/block model on this signal.
+                log::debug!("OSC 133 semantic prompt: kind={kind} exit_code={exit_code:?}");
             }
         }
     }

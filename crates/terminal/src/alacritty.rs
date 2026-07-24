@@ -32,6 +32,14 @@ use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
 use vte::ansi::Handler;
+#[cfg(unix)]
+use {
+    alacritty_terminal::{
+        event::OnResize,
+        tty::{ChildEvent, EventedPty, EventedReadWrite},
+    },
+    polling::{Event as PollingEvent, PollMode, Poller},
+};
 #[cfg(target_os = "windows")]
 use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
@@ -203,14 +211,246 @@ pub(super) fn spawn_event_loop(
     pty: AlacrittyPty,
     drain_on_exit: bool,
 ) -> Result<PtySender> {
+    // On unix the PTY read stream is teed through `TeePty` so that OSC 133
+    // semantic-prompt sequences (which `vte` otherwise silently drops) are
+    // captured before alacritty's parser consumes the bytes. The bytes are
+    // forwarded to alacritty unchanged, so normal terminal output is unaffected.
+    #[cfg(unix)]
+    let event_loop = {
+        let tee_pty = TeePty::new(pty, events_tx.clone())
+            .context("failed to set up OSC 133 tee for pty")?;
+        EventLoop::new(term, ZedListener(events_tx), tee_pty, drain_on_exit, false)
+            .context("failed to create event loop")?
+    };
+    #[cfg(not(unix))]
     let event_loop = EventLoop::new(term, ZedListener(events_tx), pty, drain_on_exit, false)
         .context("failed to create event loop")?;
+
     let pty_tx = event_loop.channel();
     let _io_thread = event_loop.spawn();
 
     Ok(PtySender {
         notifier: Notifier(pty_tx),
     })
+}
+
+/// The literal bytes that open an OSC 133 semantic-prompt sequence: `ESC ] 133 ;`.
+#[cfg(unix)]
+const OSC133_PREFIX: &[u8] = b"\x1b]133;";
+
+/// Upper bound on the payload we buffer while matching a single OSC 133
+/// sequence. Real payloads are tiny (`A`, `D;130`, ...); anything longer is not
+/// a sequence we recognize, so we abandon the match rather than grow unbounded.
+#[cfg(unix)]
+const OSC133_MAX_PAYLOAD: usize = 64;
+
+#[cfg(unix)]
+enum Osc133State {
+    /// Not inside a candidate sequence.
+    Ground,
+    /// Matched `OSC133_PREFIX` up to (but not including) this index.
+    Prefix(usize),
+    /// Past the `133;` prefix, accumulating the payload until the terminator.
+    Payload,
+    /// Saw `ESC` inside the payload; a following `\` closes the sequence (ST).
+    PayloadEscape,
+}
+
+/// Incremental matcher for OSC 133 A/B/C/D sequences. It scans raw PTY bytes and
+/// only recognizes the exact `ESC ] 133 ; ... (BEL | ESC \)` shape, ignoring all
+/// other bytes. It is deliberately not a general ANSI parser. State persists
+/// across calls so a sequence split over multiple read chunks is still matched.
+#[cfg(unix)]
+struct Osc133Matcher {
+    state: Osc133State,
+    payload: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl Osc133Matcher {
+    fn new() -> Self {
+        Self {
+            state: Osc133State::Ground,
+            payload: Vec::new(),
+        }
+    }
+
+    fn scan(&mut self, bytes: &[u8], events_tx: &UnboundedSender<PtyEvent>) {
+        for &byte in bytes {
+            match self.state {
+                Osc133State::Ground => {
+                    if byte == OSC133_PREFIX[0] {
+                        self.state = Osc133State::Prefix(1);
+                    }
+                }
+                Osc133State::Prefix(index) => {
+                    if index < OSC133_PREFIX.len() && byte == OSC133_PREFIX[index] {
+                        let next = index + 1;
+                        if next == OSC133_PREFIX.len() {
+                            self.payload.clear();
+                            self.state = Osc133State::Payload;
+                        } else {
+                            self.state = Osc133State::Prefix(next);
+                        }
+                    } else if byte == OSC133_PREFIX[0] {
+                        self.state = Osc133State::Prefix(1);
+                    } else {
+                        self.state = Osc133State::Ground;
+                    }
+                }
+                Osc133State::Payload => match byte {
+                    0x07 => {
+                        self.finish(events_tx);
+                        self.state = Osc133State::Ground;
+                    }
+                    0x1b => self.state = Osc133State::PayloadEscape,
+                    _ => {
+                        if self.payload.len() < OSC133_MAX_PAYLOAD {
+                            self.payload.push(byte);
+                        } else {
+                            self.state = Osc133State::Ground;
+                        }
+                    }
+                },
+                Osc133State::PayloadEscape => {
+                    if byte == b'\\' {
+                        self.finish(events_tx);
+                        self.state = Osc133State::Ground;
+                    } else if byte == OSC133_PREFIX[0] {
+                        self.state = Osc133State::Prefix(1);
+                    } else {
+                        self.state = Osc133State::Ground;
+                    }
+                }
+            }
+        }
+    }
+
+    fn finish(&self, events_tx: &UnboundedSender<PtyEvent>) {
+        let Some((&kind_byte, rest)) = self.payload.split_first() else {
+            return;
+        };
+        let kind = kind_byte as char;
+        if !matches!(kind, 'A' | 'B' | 'C' | 'D') {
+            return;
+        }
+        // Only the `D` (command finished) sequence carries an exit code, as
+        // `133;D;<code>`. A bare `D` reports completion with no known code.
+        let exit_code = if kind == 'D' {
+            rest.iter()
+                .position(|&byte| byte == b';')
+                .and_then(|index| rest.get(index + 1..))
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .and_then(|text| text.trim().parse::<i32>().ok())
+        } else {
+            None
+        };
+        events_tx
+            .unbounded_send(PtyEvent::Event(TerminalBackendEvent::SemanticPrompt {
+                kind,
+                exit_code,
+            }))
+            .ok();
+    }
+}
+
+/// Reader half of [`TeePty`]: reads from a clone of the PTY master fd and scans
+/// the bytes for OSC 133 before returning them unchanged to the caller.
+#[cfg(unix)]
+pub(super) struct TeeReader {
+    file: std::fs::File,
+    matcher: Osc133Matcher,
+    events_tx: UnboundedSender<PtyEvent>,
+}
+
+#[cfg(unix)]
+impl io::Read for TeeReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let count = io::Read::read(&mut self.file, buf)?;
+        if count > 0 {
+            self.matcher.scan(&buf[..count], &self.events_tx);
+        }
+        Ok(count)
+    }
+}
+
+/// Transparent wrapper around alacritty's [`tty::Pty`] that tees the read stream
+/// through an [`Osc133Matcher`]. All other `EventedPty` behavior (registration,
+/// writing, child events, resize) delegates to the inner PTY unchanged.
+///
+/// The reader reads from a `try_clone` of the PTY master fd, which shares the
+/// same open file description as the inner PTY, so every byte is read exactly
+/// once and handed to alacritty untouched. The inner fd is still what alacritty
+/// registers with the poller and writes to.
+#[cfg(unix)]
+pub(super) struct TeePty {
+    inner: AlacrittyPty,
+    reader: TeeReader,
+}
+
+#[cfg(unix)]
+impl TeePty {
+    fn new(pty: AlacrittyPty, events_tx: UnboundedSender<PtyEvent>) -> io::Result<Self> {
+        let file = pty.file().try_clone()?;
+        Ok(Self {
+            inner: pty,
+            reader: TeeReader {
+                file,
+                matcher: Osc133Matcher::new(),
+                events_tx,
+            },
+        })
+    }
+}
+
+#[cfg(unix)]
+impl EventedReadWrite for TeePty {
+    type Reader = TeeReader;
+    type Writer = std::fs::File;
+
+    unsafe fn register(
+        &mut self,
+        poll: &Arc<Poller>,
+        interest: PollingEvent,
+        poll_opts: PollMode,
+    ) -> io::Result<()> {
+        unsafe { self.inner.register(poll, interest, poll_opts) }
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &Arc<Poller>,
+        interest: PollingEvent,
+        poll_opts: PollMode,
+    ) -> io::Result<()> {
+        self.inner.reregister(poll, interest, poll_opts)
+    }
+
+    fn deregister(&mut self, poll: &Arc<Poller>) -> io::Result<()> {
+        self.inner.deregister(poll)
+    }
+
+    fn reader(&mut self) -> &mut Self::Reader {
+        &mut self.reader
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        self.inner.writer()
+    }
+}
+
+#[cfg(unix)]
+impl EventedPty for TeePty {
+    fn next_child_event(&mut self) -> Option<ChildEvent> {
+        self.inner.next_child_event()
+    }
+}
+
+#[cfg(unix)]
+impl OnResize for TeePty {
+    fn on_resize(&mut self, window_size: WindowSize) {
+        self.inner.on_resize(window_size);
+    }
 }
 
 pub(super) fn resize(term: &mut AlacrittyTerm, bounds: TerminalBounds) {
@@ -1027,6 +1267,50 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn osc133_matcher_captures_semantic_prompts_across_chunks() {
+        use futures::channel::mpsc::unbounded;
+
+        let (events_tx, mut events_rx) = unbounded::<PtyEvent>();
+        let mut matcher = Osc133Matcher::new();
+
+        // A, B, C and D-with-exit, all within a single read chunk, surrounded
+        // by ordinary output that must be ignored.
+        matcher.scan(
+            b"prompt\x1b]133;A\x07type\x1b]133;B\x07run\x1b]133;C\x07out\x1b]133;D;0\x07",
+            &events_tx,
+        );
+        // A sequence split across two chunks, terminated by ESC-backslash (ST)
+        // rather than BEL, carrying a non-zero exit code.
+        matcher.scan(b"before\x1b]13", &events_tx);
+        matcher.scan(b"3;D;130\x1b\\after", &events_tx);
+        // A bare D with no exit code.
+        matcher.scan(b"\x1b]133;D\x07", &events_tx);
+
+        drop(events_tx);
+
+        let mut captured = Vec::new();
+        while let Ok(event) = events_rx.try_recv() {
+            if let PtyEvent::Event(TerminalBackendEvent::SemanticPrompt { kind, exit_code }) = event
+            {
+                captured.push((kind, exit_code));
+            }
+        }
+
+        assert_eq!(
+            captured,
+            vec![
+                ('A', None),
+                ('B', None),
+                ('C', None),
+                ('D', Some(0)),
+                ('D', Some(130)),
+                ('D', None),
+            ]
+        );
+    }
 
     #[test]
     fn terminal_hyperlink_from_alacritty_keeps_alacritty_storage() {
