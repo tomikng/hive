@@ -1356,7 +1356,7 @@
       "cmd-alt-r": "terminal::RerunTask",
       "cmd->": "agent::AddSelectionToThread",
       // Hive: toggle the optional multi-line input editor docked below the terminal.
-      "cmd-alt-i": "terminal::ToggleInputEditor",
+      "ctrl-alt-i": "terminal::ToggleInputEditor",
     },
   },
   {
@@ -1370,7 +1370,7 @@
       "up": "terminal::InputHistoryPrevious",
       "down": "terminal::InputHistoryNext",
       "escape": "terminal::ToggleInputEditor",
-      "cmd-alt-i": "terminal::ToggleInputEditor",
+      "ctrl-alt-i": "terminal::ToggleInputEditor",
     },
   },
   {
