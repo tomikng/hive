@@ -1355,6 +1355,22 @@
       "cmd-shift-r": "task::Spawn",
       "cmd-alt-r": "terminal::RerunTask",
       "cmd->": "agent::AddSelectionToThread",
+      // Hive: toggle the optional multi-line input editor docked below the terminal.
+      "cmd-alt-i": "terminal::ToggleInputEditor",
+    },
+  },
+  {
+    // Hive: the optional multi-line terminal input editor. Enter submits the line to the
+    // PTY, shift-enter inserts a newline, up/down recall submitted input history.
+    "context": "TerminalInput > Editor",
+    "use_key_equivalents": true,
+    "bindings": {
+      "enter": "terminal::SubmitInput",
+      "shift-enter": "editor::Newline",
+      "up": "terminal::InputHistoryPrevious",
+      "down": "terminal::InputHistoryNext",
+      "escape": "terminal::ToggleInputEditor",
+      "cmd-alt-i": "terminal::ToggleInputEditor",
     },
   },
   {

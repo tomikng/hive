@@ -96,6 +96,14 @@ actions!(
     [
         /// Reruns the last executed task in the terminal.
         RerunTask,
+        /// Toggles the optional multi-line input editor docked below the terminal.
+        ToggleInputEditor,
+        /// Submits the input editor's contents to the terminal (followed by a carriage return).
+        SubmitInput,
+        /// Recalls the previous submitted input from history into the input editor.
+        InputHistoryPrevious,
+        /// Recalls the next submitted input from history into the input editor.
+        InputHistoryNext,
     ]
 );
 
@@ -155,6 +163,9 @@ pub struct TerminalView {
     self_handle: WeakEntity<Self>,
     rename_editor: Option<Entity<Editor>>,
     rename_editor_subscription: Option<Subscription>,
+    input_editor: Option<Entity<Editor>>,
+    input_history: Vec<String>,
+    history_index: Option<usize>,
     _subscriptions: Vec<Subscription>,
     _terminal_subscriptions: Vec<Subscription>,
 }
@@ -302,6 +313,9 @@ impl TerminalView {
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
             rename_editor_subscription: None,
+            input_editor: None,
+            input_history: Vec::new(),
+            history_index: None,
             _subscriptions: subscriptions,
             _terminal_subscriptions: terminal_subscriptions,
         }
@@ -658,6 +672,106 @@ impl TerminalView {
             .map(|task| terminal_rerun_override(&task.spawned_task.id))
             .unwrap_or_default();
         window.dispatch_action(Box::new(task), cx);
+    }
+
+    /// Returns whether the optional input editor currently holds keyboard focus.
+    fn input_editor_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.input_editor
+            .as_ref()
+            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
+    }
+
+    fn toggle_input_editor(
+        &mut self,
+        _: &ToggleInputEditor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_editor.take().is_some() {
+            self.history_index = None;
+            self.focus_handle.focus(window, cx);
+        } else {
+            let editor = cx.new(|cx| {
+                let mut editor = Editor::auto_height(1, 8, window, cx);
+                editor.set_placeholder_text("Send to terminal…", window, cx);
+                editor
+            });
+            editor.focus_handle(cx).focus(window, cx);
+            self.input_editor = Some(editor);
+        }
+        cx.notify();
+    }
+
+    fn submit_input(&mut self, _: &SubmitInput, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.input_editor.clone() else {
+            return;
+        };
+        let text = editor.read(cx).text(cx);
+        if text.is_empty() {
+            return;
+        }
+        self.terminal.update(cx, |terminal, _| {
+            terminal.input(text.clone().into_bytes());
+            terminal.input(b"\r".to_vec());
+        });
+        self.input_history.push(text);
+        self.history_index = None;
+        editor.update(cx, |editor, cx| editor.clear(window, cx));
+        cx.notify();
+    }
+
+    fn input_history_previous(
+        &mut self,
+        _: &InputHistoryPrevious,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.input_editor.clone() else {
+            cx.propagate();
+            return;
+        };
+        if self.input_history.is_empty() {
+            // No history: let the editor handle Up as normal cursor movement.
+            cx.propagate();
+            return;
+        }
+        let new_index = match self.history_index {
+            None => self.input_history.len() - 1,
+            Some(index) => index.saturating_sub(1),
+        };
+        self.history_index = Some(new_index);
+        if let Some(entry) = self.input_history.get(new_index).cloned() {
+            editor.update(cx, |editor, cx| editor.set_text(entry, window, cx));
+        }
+        cx.notify();
+    }
+
+    fn input_history_next(
+        &mut self,
+        _: &InputHistoryNext,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.input_editor.clone() else {
+            cx.propagate();
+            return;
+        };
+        let Some(current_index) = self.history_index else {
+            // Not navigating history: let the editor handle Down as normal cursor movement.
+            cx.propagate();
+            return;
+        };
+        if current_index + 1 < self.input_history.len() {
+            let new_index = current_index + 1;
+            self.history_index = Some(new_index);
+            if let Some(entry) = self.input_history.get(new_index).cloned() {
+                editor.update(cx, |editor, cx| editor.set_text(entry, window, cx));
+            }
+        } else {
+            self.history_index = None;
+            editor.update(cx, |editor, cx| editor.clear(window, cx));
+        }
+        cx.notify();
     }
 
     fn clear(&mut self, _: &Clear, _: &mut Window, cx: &mut Context<Self>) {
@@ -1280,6 +1394,12 @@ impl TerminalView {
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // When the optional input editor has focus, keystrokes belong to it, not the PTY.
+        // Bubble-phase key events still reach this ancestor handler, so bail out explicitly.
+        if self.input_editor_is_focused(window, cx) {
+            return;
+        }
+
         self.clear_bell(cx);
         self.pause_cursor_blinking(window, cx);
 
@@ -1343,8 +1463,11 @@ impl Render for TerminalView {
             .id("terminal-view")
             .size_full()
             .relative()
+            .flex()
+            .flex_col()
             .track_focus(&self.focus_handle(cx))
             .key_context(self.dispatch_context(cx))
+            .on_action(cx.listener(TerminalView::toggle_input_editor))
             .on_action(cx.listener(TerminalView::send_text))
             .on_action(cx.listener(TerminalView::send_keystroke))
             .on_action(cx.listener(TerminalView::copy))
@@ -1392,7 +1515,10 @@ impl Render for TerminalView {
                 // TODO: Oddly this wrapper div is needed for TerminalElement to not steal events from the context menu
                 div()
                     .id("terminal-view-container")
-                    .size_full()
+                    .when(self.input_editor.is_none(), |this| this.size_full())
+                    .when(self.input_editor.is_some(), |this| {
+                        this.flex_1().min_h_0().w_full()
+                    })
                     .bg(cx.theme().colors().editor_background)
                     .child(TerminalElement::new(
                         terminal_handle,
@@ -1419,6 +1545,23 @@ impl Render for TerminalView {
                         )
                     }),
             )
+            .when_some(self.input_editor.clone(), |this, editor| {
+                this.child(
+                    div()
+                        .key_context("TerminalInput")
+                        .on_action(cx.listener(TerminalView::submit_input))
+                        .on_action(cx.listener(TerminalView::input_history_previous))
+                        .on_action(cx.listener(TerminalView::input_history_next))
+                        .w_full()
+                        .flex_shrink_0()
+                        .border_t_1()
+                        .border_color(cx.theme().colors().border)
+                        .bg(cx.theme().colors().editor_background)
+                        .px_2()
+                        .py_1()
+                        .child(editor),
+                )
+            })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
