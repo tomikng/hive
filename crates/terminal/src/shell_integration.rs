@@ -124,7 +124,33 @@ fn bash_rcfile_path(integration_script: &Path) -> Result<&'static Path, String> 
          if [ -n \"$HOME\" ] && [ -f \"$HOME/.bashrc\" ]; then\n\
          \t. \"$HOME/.bashrc\"\n\
          fi\n\
-         . {integration_script}\n",
+         # Capture any DEBUG trap .bashrc just installed (bash-preexec, \
+         # command timers, ...) here, at this file's own source depth, and \
+         # hand it to the integration script via an env var: on bash 3.2 \
+         # (macOS's system /bin/bash), `trap -p DEBUG` reports nothing when \
+         # queried from a file sourced-from-a-sourced-file (which is what \
+         # the integration script would otherwise be, since it's sourced \
+         # from this already-once-sourced rcfile). No command substitution \
+         # is used here either, since forking a subshell while a DEBUG \
+         # trap is installed corrupts bash 3.2's trap bookkeeping.\n\
+         __hive_debug_trap_capture_file=\"${{TMPDIR:-/tmp}}/hive-debug-trap.$$\"\n\
+         trap -p DEBUG >\"$__hive_debug_trap_capture_file\" 2>/dev/null\n\
+         IFS= read -r __HIVE_PREV_DEBUG_TRAP < \"$__hive_debug_trap_capture_file\"\n\
+         rm -f \"$__hive_debug_trap_capture_file\"\n\
+         unset __hive_debug_trap_capture_file\n\
+         export __HIVE_PREV_DEBUG_TRAP\n\
+         . {integration_script}\n\
+         # (Re-)install the DEBUG trap here too, one more time, at this \
+         # file's own source depth: on bash 3.2, *replacing* an existing \
+         # DEBUG trap from a nested source context (this rcfile sourcing \
+         # the integration script) silently fails to take effect, leaving \
+         # the old trap permanently active even though the integration \
+         # script's own `trap ... DEBUG` line ran without error. Only \
+         # needed when __hive_preexec was actually defined (interactive \
+         # bash sessions; the integration script no-ops otherwise).\n\
+         if typeset -f __hive_preexec >/dev/null 2>&1; then\n\
+         \ttrap '__hive_preexec' DEBUG\n\
+         fi\n",
         integration_script = shell_quote(&integration_script.to_string_lossy()),
     );
     materialize_once(
