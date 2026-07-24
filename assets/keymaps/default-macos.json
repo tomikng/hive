@@ -1350,6 +1350,9 @@
       // terminal-first workflow uses cmd-d to open the uncommitted changes diff.
       "cmd-d": "git::Diff",
       "cmd-e": "file_finder::Toggle",
+      // Hive: the Workspace binding for task::Spawn is scoped `Workspace && !Terminal`,
+      // so re-bind it here or saved commands can't be launched while a session terminal is focused.
+      "cmd-shift-r": "task::Spawn",
       "cmd-alt-r": "terminal::RerunTask",
       "cmd->": "agent::AddSelectionToThread",
     },
