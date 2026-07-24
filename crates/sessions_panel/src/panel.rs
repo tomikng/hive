@@ -1,10 +1,13 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, Pixels, Render, SystemNotification, WeakEntity, Window, actions, px,
+    FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification, WeakEntity, Window,
+    actions, px,
 };
+use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use ui::{Indicator, ListItem, prelude::*};
 use workspace::{
@@ -22,6 +25,7 @@ pub struct SessionsPanel {
     focus_handle: FocusHandle,
     window_handle: AnyWindowHandle,
     pub(crate) trackers: HashMap<EntityId, StatusTracker>,
+    _git_subscription: Subscription,
 }
 
 pub fn init(cx: &mut App) {
@@ -48,6 +52,7 @@ impl SessionsPanel {
         workspace.update_in(&mut cx, |workspace, window, cx| {
             let weak = workspace.weak_handle();
             let window_handle = window.window_handle();
+            let git_store = workspace.project().read(cx).git_store().clone();
             cx.new(|cx| {
                 cx.spawn(async move |this: WeakEntity<Self>, cx| {
                     loop {
@@ -58,11 +63,33 @@ impl SessionsPanel {
                     }
                 })
                 .detach();
+                // Repaints the project header rows' diff-stats on any status change,
+                // for any repository (not just the active one) since the panel lists
+                // every open project. Mirrors the subscribe_in pattern used by
+                // git_panel.rs's own GitStoreEvent subscription.
+                let git_subscription = cx.subscribe_in(
+                    &git_store,
+                    window,
+                    |_this, _git_store, event, _window, cx| match event {
+                        GitStoreEvent::RepositoryUpdated(
+                            _,
+                            RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                            _,
+                        )
+                        | GitStoreEvent::RepositoryAdded
+                        | GitStoreEvent::RepositoryRemoved(_)
+                        | GitStoreEvent::ActiveRepositoryChanged(_) => {
+                            cx.notify();
+                        }
+                        _ => {}
+                    },
+                );
                 SessionsPanel {
                     workspace: weak,
                     focus_handle: cx.focus_handle(),
                     window_handle,
                     trackers: HashMap::default(),
+                    _git_subscription: git_subscription,
                 }
             })
         })
@@ -180,6 +207,43 @@ impl SessionsPanel {
         groups
     }
 
+    /// Uncommitted-changes summary `(changed_files, added_lines, deleted_lines)`
+    /// for the repository whose work directory contains `worktree_abs_path`,
+    /// or `None` when there are no uncommitted changes.
+    ///
+    /// Sums `StatusEntry::diff_stat` (head-to-worktree, i.e. staged and
+    /// unstaged combined) rather than `staged_diff_stat`/`unstaged_diff_stat`,
+    /// since the sidebar shows one total per project rather than a
+    /// staged/unstaged split.
+    fn project_diff_stat(&self, worktree_abs_path: &Path, cx: &App) -> Option<(usize, u32, u32)> {
+        let workspace = self.workspace.upgrade()?;
+        let project = workspace.read(cx).project().read(cx);
+        let git_store = project.git_store().read(cx);
+        // Match the innermost repository whose work directory contains the
+        // worktree root, mirroring GitStore::set_active_repo_for_worktree.
+        let repository = git_store
+            .repositories()
+            .values()
+            .filter(|repository| {
+                worktree_abs_path.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
+            })
+            .max_by_key(|repository| repository.read(cx).work_directory_abs_path.as_os_str().len())?
+            .read(cx);
+
+        let summary = repository.status_summary();
+        if summary.count == 0 {
+            return None;
+        }
+
+        let (added, deleted) = repository
+            .status()
+            .filter_map(|entry| entry.diff_stat)
+            .fold((0u32, 0u32), |(added, deleted), diff_stat| {
+                (added + diff_stat.added, deleted + diff_stat.deleted)
+            });
+        Some((summary.count, added, deleted))
+    }
+
     fn render_session(
         &self,
         terminal_view: Entity<TerminalView>,
@@ -213,11 +277,24 @@ impl Render for SessionsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut root = v_flex().size_full().p_1();
         for (project_root, terminals) in self.sessions(cx) {
-            let name = std::path::Path::new(&project_root)
+            let project_root_path = Path::new(&project_root);
+            let name = project_root_path
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| project_root.clone());
-            root = root.child(Label::new(name).size(LabelSize::Small).color(Color::Muted));
+            let mut header = h_flex()
+                .gap_2()
+                .child(Label::new(name).size(LabelSize::Small).color(Color::Muted));
+            if let Some((files, added, deleted)) =
+                self.project_diff_stat(project_root_path, cx)
+            {
+                header = header.child(
+                    Label::new(format!("±{files} · +{added} −{deleted}"))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                );
+            }
+            root = root.child(header);
             for terminal_view in terminals {
                 root = root.child(self.render_session(terminal_view, cx));
             }
