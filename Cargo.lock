@@ -13941,6 +13941,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "pr_viewer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "git",
+ "gpui",
+ "picker",
+ "project",
+ "serde",
+ "serde_json",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "precomputed-hash"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23291,6 +23307,7 @@ dependencies = [
  "paths",
  "picker",
  "pkg-config",
+ "pr_viewer",
  "pretty_assertions",
  "profiling",
  "project",
