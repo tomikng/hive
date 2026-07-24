@@ -707,7 +707,9 @@
       "cmd-k s": "workspace::SaveWithoutFormat",
       "alt-shift-enter": "toast::RunAction",
       "cmd-shift-s": "workspace::SaveAs",
-      "cmd-shift-n": "workspace::NewWindow",
+      // Hive: was workspace::NewWindow upstream; terminal-first workflow uses
+      // cmd-shift-n to create a git worktree instead (see git::CreateWorktree below).
+      "cmd-shift-n": ["git::CreateWorktree", { "branch_target": { "kind": "current_branch" } }],
       "ctrl-`": "terminal_panel::Toggle",
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],
@@ -740,7 +742,9 @@
       "cmd-k cmd-t": "theme_selector::Toggle",
       "cmd-k cmd-shift-t": "theme::ToggleMode",
       "ctrl-alt-cmd-p": "settings_profile_selector::Toggle",
-      "cmd-t": "project_symbols::Toggle",
+      // Hive: was project_symbols::Toggle upstream; terminal-first workflow uses
+      // cmd-t to open a new session (terminal) instead.
+      "cmd-t": "sessions_panel::NewSession",
       "cmd-p": "file_finder::Toggle",
       "ctrl-shift-tab": ["tab_switcher::Toggle", { "select_last": true }],
       "ctrl-tab": "tab_switcher::Toggle",
@@ -1342,7 +1346,10 @@
       "ctrl-alt-down": "pane::SplitDown",
       "ctrl-alt-left": "pane::SplitLeft",
       "ctrl-alt-right": "pane::SplitRight",
-      "cmd-d": "pane::SplitRight",
+      // Hive: was pane::SplitRight upstream (still available via ctrl-alt-right);
+      // terminal-first workflow uses cmd-d to open the uncommitted changes diff.
+      "cmd-d": "git::Diff",
+      "cmd-e": "file_finder::Toggle",
       "cmd-alt-r": "terminal::RerunTask",
       "cmd->": "agent::AddSelectionToThread",
     },

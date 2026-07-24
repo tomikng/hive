@@ -5,7 +5,7 @@ use gpui::{
     AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
     FocusHandle, Focusable, Pixels, Render, SystemNotification, WeakEntity, Window, actions, px,
 };
-use terminal_view::TerminalView;
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use ui::{Indicator, ListItem, prelude::*};
 use workspace::{
     Toast, Workspace,
@@ -15,7 +15,7 @@ use workspace::{
 
 use crate::status::{SessionStatus, StatusTracker};
 
-actions!(sessions_panel, [ToggleFocus]);
+actions!(sessions_panel, [ToggleFocus, NewSession]);
 
 pub struct SessionsPanel {
     workspace: WeakEntity<Workspace>,
@@ -28,6 +28,13 @@ pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
             workspace.toggle_panel_focus::<SessionsPanel>(window, cx);
+        });
+        workspace.register_action(|workspace, _: &NewSession, window, cx| {
+            let cwd = terminal_view::default_working_directory(workspace, cx);
+            TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
+                project.create_terminal_shell(cwd, cx)
+            })
+            .detach_and_log_err(cx);
         });
     })
     .detach();
