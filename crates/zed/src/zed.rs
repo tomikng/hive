@@ -62,6 +62,7 @@ use paths::{
 };
 use project::{DirectoryLister, DisableAiSettings, ProjectItem};
 use project_panel::ProjectPanel;
+use sessions_panel::SessionsPanel;
 use quick_action_bar::QuickActionBar;
 use recent_projects::open_remote_project;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
@@ -773,6 +774,7 @@ fn show_software_emulation_warning_if_needed(
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
         let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
+        let sessions_panel = SessionsPanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
         let terminal_panel = TerminalPanel::load(workspace_handle.clone(), cx.clone());
         let git_panel = GitPanel::load(workspace_handle.clone(), cx.clone());
@@ -796,6 +798,7 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
 
         futures::join!(
             add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
+            add_panel_when_ready(sessions_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(terminal_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(git_panel, workspace_handle.clone(), cx.clone()),

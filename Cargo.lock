@@ -23310,6 +23310,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session",
+ "sessions_panel",
  "settings",
  "settings_profile_selector",
  "settings_ui",
