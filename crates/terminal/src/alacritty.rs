@@ -461,6 +461,18 @@ pub(super) fn display_offset(term: &AlacrittyTerm) -> usize {
     term.grid().display_offset()
 }
 
+/// The terminal's current cursor line, as a grid-relative row index for the
+/// command-block tracker (see `command_blocks.rs`).
+///
+/// This is `term.grid().cursor.point.line`, which is `0` at the top of the
+/// live viewport and negative while in scrollback history. Negative values
+/// are clamped to `0`: OSC 133 marks fire as the shell writes new output, so
+/// the cursor is expected to be at/near the live viewport, not scrolled back;
+/// the clamp just avoids ever handing the tracker a nonsensical line number.
+pub(super) fn current_grid_line(term: &AlacrittyTerm) -> usize {
+    term.grid().cursor.point.line.0.max(0) as usize
+}
+
 pub(super) fn scroll_display(term: &mut AlacrittyTerm, scroll: Scroll) {
     term.scroll_display(scroll.to_alacritty());
 }

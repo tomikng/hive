@@ -1,9 +1,13 @@
 mod mappings;
 
 mod alacritty;
+mod command_blocks;
 mod pty_info;
 mod shell_integration;
 pub mod terminal_settings;
+
+use command_blocks::CommandBlockTracker;
+pub use command_blocks::CommandBlock;
 
 #[cfg(not(windows))]
 use anyhow::Context as _;
@@ -65,8 +69,9 @@ use crate::alacritty::current_child_signal_mask;
 use crate::alacritty::{
     AlacrittyCell, AlacrittyGridIterator, AlacrittyHyperlink, AlacrittySearch, AlacrittyTerm,
     AlacrittyTermConfig, AlacrittyTermLock, HyperlinkMatch, PtySender, RegexSearches,
-    append_text_to_term, apply_config, clear_saved_screen, content_text, display_offset,
-    display_only_term_config, find_from_terminal_point, full_content_range, last_non_empty_lines,
+    append_text_to_term, apply_config, clear_saved_screen, content_text, current_grid_line,
+    display_offset, display_only_term_config, find_from_terminal_point, full_content_range,
+    last_non_empty_lines,
     make_content, new_term, open_pty, pty_options, pty_term_config, resize, screen_lines,
     scroll_display, scroll_to_point, search_matches, selection_text, set_default_cursor_style,
     set_selection as set_term_selection, shrink_to_used, spawn_event_loop,
@@ -1017,6 +1022,7 @@ impl TerminalBuilder {
             next_link_id: 0,
             selection_phase: SelectionPhase::Ended,
             hyperlink_regex_searches: RegexSearches::default(),
+            command_block_tracker: CommandBlockTracker::new(),
             vi_mode_enabled: false,
             is_remote_terminal: false,
             last_mouse_move_time: Instant::now(),
@@ -1298,6 +1304,7 @@ impl TerminalBuilder {
                     &path_hyperlink_regexes,
                     path_hyperlink_timeout_ms,
                 ),
+                command_block_tracker: CommandBlockTracker::new(),
                 vi_mode_enabled: false,
                 is_remote_terminal,
                 last_mouse_move_time: Instant::now(),
@@ -1503,6 +1510,7 @@ pub struct Terminal {
     selection_phase: SelectionPhase,
     hyperlink_regex_searches: RegexSearches,
     task: Option<TaskState>,
+    command_block_tracker: CommandBlockTracker,
     vi_mode_enabled: bool,
     is_remote_terminal: bool,
     last_mouse_move_time: Instant,
@@ -1662,9 +1670,9 @@ impl Terminal {
                 self.register_task_finished(Some(exit_status), cx);
             }
             TerminalBackendEvent::SemanticPrompt { kind, exit_code } => {
-                // Spike: prove OSC 133 capture reaches Zed. Tasks 3-4 will build
-                // the command-boundary/block model on this signal.
-                log::debug!("OSC 133 semantic prompt: kind={kind} exit_code={exit_code:?}");
+                let current_line = current_grid_line(&self.term.lock());
+                self.command_block_tracker
+                    .on_semantic_prompt(kind, exit_code, current_line);
             }
         }
     }
@@ -1898,6 +1906,13 @@ impl Terminal {
 
     pub fn last_content(&self) -> &Content {
         &self.last_content
+    }
+
+    /// Command blocks reconstructed from OSC 133 semantic-prompt marks, for
+    /// the terminal renderer to draw. See [`crate::command_blocks`] for the
+    /// scrollback-anchoring caveat on the line numbers within each block.
+    pub fn command_blocks(&self) -> &[CommandBlock] {
+        self.command_block_tracker.blocks()
     }
 
     pub fn set_cursor_shape(&mut self, cursor_shape: SettingsCursorShape) {
