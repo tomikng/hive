@@ -757,6 +757,19 @@ impl ProjectDiffToolbar {
             })
             .ok();
     }
+
+    fn approve_all_and_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let Some(panel) = workspace.panel::<GitPanel>(cx) else {
+                    return;
+                };
+                panel.update(cx, |panel, cx| {
+                    panel.approve_all_and_commit(window, cx);
+                });
+            })
+            .ok();
+    }
 }
 
 impl EventEmitter<ToolbarItemEvent> for ProjectDiffToolbar {}
@@ -938,6 +951,18 @@ impl Render for ProjectDiffToolbar {
                         this.dispatch_action(&Commit, window, cx);
                     })),
             )
+            .when(!is_multibuffer_empty, |this| {
+                this.child(
+                    Button::new("approve-all-and-commit", "Approve all & commit")
+                        .style(ButtonStyle::Filled)
+                        .tooltip(Tooltip::text(
+                            "Stage every changed file and open the commit flow",
+                        ))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.approve_all_and_commit(window, cx);
+                        })),
+                )
+            })
             .when(review_count > 0, |el| {
                 el.child(Divider::vertical()).child(
                     render_send_review_to_agent_button(review_count, &focus_handle).on_click(

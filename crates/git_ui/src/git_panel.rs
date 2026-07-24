@@ -2012,49 +2012,68 @@ impl GitPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path_style = self.project.read(cx).path_style(cx);
         maybe!({
             let list_entry = self.entries.get(self.selected_entry?)?.clone();
             let entry = list_entry.status_entry()?.to_owned();
-            let skip_prompt = action.skip_prompt || entry.status.is_created();
-
-            let prompt = if skip_prompt {
-                Task::ready(Ok(0))
-            } else {
-                let prompt = window.prompt(
-                    PromptLevel::Warning,
-                    &format!(
-                        "Are you sure you want to discard changes to {}?",
-                        MarkdownInlineCode(
-                            entry
-                                .repo_path
-                                .file_name()
-                                .unwrap_or(entry.repo_path.display(path_style).as_ref())
-                        ),
-                    ),
-                    None,
-                    &["Discard Changes", "Cancel"],
-                    cx,
-                );
-                cx.background_spawn(prompt)
-            };
-
-            let this = cx.weak_entity();
-            window
-                .spawn(cx, async move |cx| {
-                    if prompt.await? != 0 {
-                        return anyhow::Ok(());
-                    }
-
-                    this.update_in(cx, |this, window, cx| {
-                        this.revert_entry(&entry, window, cx);
-                    })?;
-
-                    Ok(())
-                })
-                .detach();
+            self.revert_entry_with_confirmation(entry, action.skip_prompt, window, cx);
             Some(())
         });
+    }
+
+    /// Discards the working-tree changes to a single file, prompting for
+    /// confirmation first (unless `skip_prompt` is set or the file is
+    /// untracked, in which case discarding is non-destructive to history and
+    /// falls back to the "trash file" flow in [`Self::revert_entry`]).
+    ///
+    /// Unlike [`Self::revert_selected`], this does not require `entry` to be
+    /// the panel's currently selected/focused entry, so it can be used to
+    /// discard a specific file's changes from contexts (like a diff pane's
+    /// per-file header) where the selection may point elsewhere.
+    fn revert_entry_with_confirmation(
+        &mut self,
+        entry: GitStatusEntry,
+        skip_prompt: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path_style = self.project.read(cx).path_style(cx);
+        let skip_prompt = skip_prompt || entry.status.is_created();
+
+        let prompt = if skip_prompt {
+            Task::ready(Ok(0))
+        } else {
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                &format!(
+                    "Are you sure you want to discard changes to {}?",
+                    MarkdownInlineCode(
+                        entry
+                            .repo_path
+                            .file_name()
+                            .unwrap_or(entry.repo_path.display(path_style).as_ref())
+                    ),
+                ),
+                None,
+                &["Discard Changes", "Cancel"],
+                cx,
+            );
+            cx.background_spawn(prompt)
+        };
+
+        let this = cx.weak_entity();
+        window
+            .spawn(cx, async move |cx| {
+                if prompt.await? != 0 {
+                    return anyhow::Ok(());
+                }
+
+                this.update_in(cx, |this, window, cx| {
+                    this.revert_entry(&entry, window, cx);
+                })?;
+
+                Ok(())
+            })
+            .detach();
     }
 
     fn add_to_gitignore(
@@ -2487,6 +2506,39 @@ impl GitPanel {
 
     pub fn unstage_all(&mut self, _: &UnstageAll, _window: &mut Window, cx: &mut Context<Self>) {
         self.change_all_files_stage(false, cx);
+    }
+
+    /// Stages every changed file (including untracked files, unlike
+    /// [`Self::commit_changes`]'s implicit stage-all-tracked fallback) and,
+    /// once staging has actually completed, opens the commit flow via
+    /// [`Self::commit_changes`]. Sequencing the commit after the stage task
+    /// resolves (rather than dispatching `git::StageAll` and `git::Commit`
+    /// back-to-back) avoids a race where the commit could fire against a
+    /// working tree that hasn't finished staging yet.
+    ///
+    /// This cannot double-commit or commit an empty tree: `commit_changes`
+    /// itself always calls `commit_options()` with `allow_empty: false` and
+    /// bails out early if there are unresolved conflicts or no commit
+    /// message/changes.
+    pub(crate) fn approve_all_and_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(active_repository) = self.active_repository.clone() else {
+            return;
+        };
+        let stage_task = active_repository.update(cx, |repo, cx| repo.stage_all(cx));
+        let options = self.commit_options();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = stage_task.await;
+            this.update_in(cx, |this, window, cx| {
+                if let Err(err) = result {
+                    this.show_error_toast("add", err, cx);
+                    this.update_counts(active_repository.read(cx));
+                    return;
+                }
+                this.update_counts(active_repository.read(cx));
+                this.commit_changes(options, window, cx);
+            })
+        })
+        .detach_and_log_err(cx);
     }
 
     fn toggle_staged_for_entry(
@@ -6928,11 +6980,62 @@ impl GitPanel {
                         .ok();
                 }
             });
+
+        let has_write_access = self.has_write_access(cx);
+        // "Keep" stages this one file directly via `change_file_stage`, the
+        // same repo-path-scoped call the checkbox above uses; "Undo" reuses
+        // the same confirm-then-discard flow as the `git::RestoreFile`
+        // action (see `revert_entry_with_confirmation`), just scoped to this
+        // file instead of the panel's current selection.
+        let keep_and_undo = entry.status_entry().map(|status_entry| {
+            let keep_entry = status_entry.clone();
+            let keep_panel = entity.downgrade();
+            let undo_entry = status_entry.clone();
+            let undo_panel = entity.downgrade();
+            h_flex()
+                .gap_1()
+                .child(
+                    IconButton::new("keep-file", IconName::Check)
+                        .icon_size(IconSize::Small)
+                        .disabled(!has_write_access)
+                        .tooltip(Tooltip::text("Keep (stage this file)"))
+                        .on_click(move |_, _window, cx| {
+                            keep_panel
+                                .update(cx, |this, cx| {
+                                    this.change_file_stage(true, vec![keep_entry.clone()], cx);
+                                    cx.stop_propagation();
+                                })
+                                .ok();
+                        }),
+                )
+                .child(
+                    IconButton::new("undo-file", IconName::Undo)
+                        .icon_size(IconSize::Small)
+                        .disabled(!has_write_access)
+                        .tooltip(Tooltip::text("Undo (discard changes to this file)"))
+                        .on_click(move |_, window, cx| {
+                            undo_panel
+                                .update(cx, |this, cx| {
+                                    this.revert_entry_with_confirmation(
+                                        undo_entry.clone(),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                })
+                                .ok();
+                        }),
+                )
+        });
+
         Some(
             h_flex()
                 .id("start-slot")
+                .gap_1()
                 .text_lg()
                 .child(checkbox)
+                .children(keep_and_undo)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| {
                     // prevent the list item active state triggering when toggling checkbox
                     cx.stop_propagation();
