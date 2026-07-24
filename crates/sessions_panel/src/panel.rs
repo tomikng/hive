@@ -16,7 +16,7 @@ use workspace::{
     notifications::NotificationId,
 };
 
-use crate::status::{SessionStatus, StatusTracker};
+use crate::status::{SessionStatus, StatusTracker, is_agent};
 
 actions!(sessions_panel, [ToggleFocus, NewSession]);
 
@@ -25,6 +25,15 @@ pub struct SessionsPanel {
     focus_handle: FocusHandle,
     window_handle: AnyWindowHandle,
     pub(crate) trackers: HashMap<EntityId, StatusTracker>,
+    /// Per-terminal (last seen cursor position, when it last moved). The
+    /// cursor moves whenever the terminal renders new output, so "cursor
+    /// unchanged since `Instant`" is used as a cheap proxy for "no output
+    /// since `Instant`" -- there's no dedicated last-output timestamp or byte
+    /// counter on `Terminal` to read instead. This can under-count quiet time
+    /// for output that redraws in place without moving the cursor (e.g. some
+    /// spinners), which is one more reason `NeedsInput` is a heuristic, not a
+    /// fact.
+    activity: HashMap<EntityId, (terminal::Point, Instant)>,
     _git_subscription: Subscription,
 }
 
@@ -89,6 +98,7 @@ impl SessionsPanel {
                     focus_handle: cx.focus_handle(),
                     window_handle,
                     trackers: HashMap::default(),
+                    activity: HashMap::default(),
                     _git_subscription: git_subscription,
                 }
             })
@@ -124,18 +134,27 @@ impl SessionsPanel {
 
         self.trackers
             .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
+        self.activity
+            .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
 
         for terminal_view in terminals {
-            let foreground = terminal_view
-                .read(cx)
-                .terminal()
-                .read(cx)
-                .foreground_process_command_name();
+            let terminal = terminal_view.read(cx).terminal().read(cx);
+            let foreground = terminal.foreground_process_command_name();
+            let cursor = terminal.last_content().cursor.point;
+
+            let last_activity =
+                self.activity.entry(terminal_view.entity_id()).or_insert((cursor, now));
+            if last_activity.0 != cursor {
+                *last_activity = (cursor, now);
+            }
+            let quiet_for = now.saturating_duration_since(last_activity.1);
+            let agent = foreground.as_deref().is_some_and(is_agent);
+
             let tracker = self
                 .trackers
                 .entry(terminal_view.entity_id())
                 .or_insert_with(StatusTracker::new);
-            if let Some(finished) = tracker.update(foreground.as_deref(), now) {
+            if let Some(finished) = tracker.update(foreground.as_deref(), quiet_for, agent, now) {
                 if finished.duration >= threshold {
                     let mins = finished.duration.as_secs() / 60;
                     let secs = finished.duration.as_secs() % 60;
@@ -257,6 +276,9 @@ impl SessionsPanel {
             .unwrap_or(SessionStatus::Idle);
         let indicator = match status {
             SessionStatus::Running { .. } => Indicator::dot().color(Color::Modified),
+            // Heuristic-only status (see status.rs) -- distinct amber color so
+            // it doesn't read as the same "actively running" state.
+            SessionStatus::NeedsInput { .. } => Indicator::dot().color(Color::Warning),
             SessionStatus::Idle => Indicator::dot().color(Color::Hidden),
         };
         let workspace = self.workspace.clone();
