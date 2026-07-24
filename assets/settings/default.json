@@ -2081,6 +2081,11 @@
     "show_count_badge": false,
     // Whether to invoke the OS-specific alert sound when the terminal bell (BEL character) is printed.
     "bell": "off",
+    // Whether to inject Hive's shell integration script into interactive terminals, so the shell
+    // emits OSC 133 sequences around each prompt/command (used to detect command boundaries, e.g.
+    // for command blocks). Only zsh and bash are supported. Set to false to disable if it
+    // interferes with your shell setup.
+    "shell_integration": true,
   },
   "code_actions_on_format": {},
   // Settings related to running tasks.

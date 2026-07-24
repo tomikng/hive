@@ -2,6 +2,7 @@ mod mappings;
 
 mod alacritty;
 mod pty_info;
+mod shell_integration;
 pub mod terminal_settings;
 
 #[cfg(not(windows))]
@@ -1024,6 +1025,7 @@ impl TerminalBuilder {
                 path_hyperlink_regexes: Vec::default(),
                 path_hyperlink_timeout_ms: 0,
                 window_id,
+                shell_integration: false,
             },
             child_exited: None,
             keyboard_input_sent: false,
@@ -1060,6 +1062,7 @@ impl TerminalBuilder {
         cx: &App,
         activation_script: Vec<String>,
         path_style: PathStyle,
+        shell_integration: bool,
     ) -> Task<Result<TerminalBuilder>> {
         let version = release_channel::AppVersion::global(cx);
         let background_executor = cx.background_executor().clone();
@@ -1206,12 +1209,18 @@ impl TerminalBuilder {
                 };
                 (TerminalType::DisplayOnly, Some(subprocess))
             } else {
-                let alacritty_shell = shell_params.as_ref().map(|params| {
+                let mut alacritty_shell = shell_params.as_ref().map(|params| {
                     (
                         params.program.clone(),
                         params.args.clone().unwrap_or_default(),
                     )
                 });
+                if shell_integration
+                    && let Some(overridden_shell) =
+                        shell_integration::inject(&shell, cfg!(windows), &mut env)
+                {
+                    alacritty_shell = Some(overridden_shell);
+                }
                 let pty_options = pty_options(
                     alacritty_shell,
                     working_directory.clone(),
@@ -1297,6 +1306,7 @@ impl TerminalBuilder {
                     path_hyperlink_regexes,
                     path_hyperlink_timeout_ms,
                     window_id,
+                    shell_integration,
                 },
                 child_exited: None,
                 keyboard_input_sent: false,
@@ -1515,6 +1525,7 @@ struct CopyTemplate {
     path_hyperlink_regexes: Vec<String>,
     path_hyperlink_timeout_ms: u64,
     window_id: u64,
+    shell_integration: bool,
 }
 
 #[derive(Debug)]
@@ -2992,6 +3003,7 @@ impl Terminal {
             cx,
             self.activation_script.clone(),
             self.path_style,
+            self.template.shell_integration,
         )
     }
 }
@@ -3537,6 +3549,7 @@ mod tests {
                     cx,
                     vec![],
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -3588,6 +3601,7 @@ mod tests {
                     cx,
                     vec![],
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -3993,6 +4007,7 @@ mod tests {
                     cx,
                     Vec::new(),
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -4061,6 +4076,7 @@ mod tests {
                     cx,
                     Vec::new(),
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -4127,6 +4143,7 @@ mod tests {
                     cx,
                     Vec::new(),
                     PathStyle::local(),
+                    false,
                 )
             })
             .await
@@ -5096,6 +5113,7 @@ mod tests {
                         cx,
                         vec![],
                         PathStyle::local(),
+                        false,
                     )
                 })
                 .await

@@ -258,6 +258,9 @@ impl Project {
                         cx,
                         activation_script,
                         path_style,
+                        // Task terminals run a specific one-off command, not an
+                        // interactive prompt loop, so OSC 133 injection doesn't apply.
+                        false,
                     ))
                 })??
                 .await?;
@@ -428,6 +431,7 @@ impl Project {
                         cx,
                         activation_script,
                         path_style,
+                        settings.shell_integration,
                     ))
                 })??
                 .await?;

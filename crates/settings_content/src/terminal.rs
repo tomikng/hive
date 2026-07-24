@@ -191,6 +191,14 @@ pub struct TerminalSettingsContent {
     ///
     /// Default: "system"
     pub bell: Option<TerminalBell>,
+    /// Whether to inject Hive's shell integration script into interactive
+    /// terminals. This makes the shell emit OSC 133 sequences around each
+    /// prompt/command, which Hive uses to detect command boundaries (e.g.
+    /// for command blocks). Only zsh and bash are supported; other shells
+    /// are unaffected. Disable this if it interferes with your shell setup.
+    ///
+    /// Default: true
+    pub shell_integration: Option<bool>,
 }
 
 /// Shell configuration to open the terminal with.
