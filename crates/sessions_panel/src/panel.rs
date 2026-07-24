@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    Pixels, Render, WeakEntity, Window, actions, px,
+    AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Pixels, Render, SystemNotification, WeakEntity, Window, actions, px,
 };
 use terminal_view::TerminalView;
 use ui::{Indicator, ListItem, prelude::*};
@@ -18,6 +19,7 @@ actions!(sessions_panel, [ToggleFocus]);
 pub struct SessionsPanel {
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
+    window_handle: AnyWindowHandle,
     pub(crate) trackers: HashMap<EntityId, StatusTracker>,
 }
 
@@ -35,14 +37,82 @@ impl SessionsPanel {
         workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
     ) -> anyhow::Result<Entity<Self>> {
-        workspace.update_in(&mut cx, |workspace, _window, cx| {
+        workspace.update_in(&mut cx, |workspace, window, cx| {
             let weak = workspace.weak_handle();
-            cx.new(|cx| SessionsPanel {
-                workspace: weak,
-                focus_handle: cx.focus_handle(),
-                trackers: HashMap::default(),
+            let window_handle = window.window_handle();
+            cx.new(|cx| {
+                cx.spawn(async move |this: WeakEntity<Self>, cx| {
+                    loop {
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        let Ok(()) = this.update(cx, |this, cx| this.poll_statuses(cx)) else {
+                            break; // panel dropped
+                        };
+                    }
+                })
+                .detach();
+                SessionsPanel {
+                    workspace: weak,
+                    focus_handle: cx.focus_handle(),
+                    window_handle,
+                    trackers: HashMap::default(),
+                }
             })
         })
+    }
+
+    // ponytail: env var instead of settings plumbing; wire into SettingsContent when
+    // someone actually asks to configure it in the UI
+    fn notify_threshold() -> Duration {
+        std::env::var("HIVE_NOTIFY_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30))
+    }
+
+    /// Reads each terminal's foreground process, feeds the per-terminal
+    /// `StatusTracker`, and fires a native notification when a command
+    /// finishes at or above the threshold while the window is inactive.
+    fn poll_statuses(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let terminals: Vec<Entity<TerminalView>> =
+            workspace.read(cx).items_of_type::<TerminalView>(cx).collect();
+        let window_active = self
+            .window_handle
+            .update(cx, |_, window, _| window.is_window_active())
+            .unwrap_or(true);
+        let now = Instant::now();
+
+        self.trackers
+            .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
+
+        for terminal_view in terminals {
+            let foreground = terminal_view
+                .read(cx)
+                .terminal()
+                .read(cx)
+                .foreground_process_command_name();
+            let tracker = self
+                .trackers
+                .entry(terminal_view.entity_id())
+                .or_insert_with(StatusTracker::new);
+            if let Some(finished) = tracker.update(foreground.as_deref(), now) {
+                if finished.duration >= Self::notify_threshold() && !window_active {
+                    let mins = finished.duration.as_secs() / 60;
+                    let secs = finished.duration.as_secs() % 60;
+                    let title = terminal_view.read(cx).terminal().read(cx).title(true);
+                    cx.show_system_notification(SystemNotification {
+                        tag: format!("hive-session-{}", terminal_view.entity_id()).into(),
+                        title: format!("{} finished", finished.command).into(),
+                        body: format!("{title} · {mins}m {secs}s").into(),
+                        actions: Vec::new(),
+                    });
+                }
+            }
+        }
+        cx.notify(); // re-render badges
     }
 
     /// All terminal items in the window's center panes, grouped by
