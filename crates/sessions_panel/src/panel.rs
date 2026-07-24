@@ -8,8 +8,9 @@ use gpui::{
 use terminal_view::TerminalView;
 use ui::{Indicator, ListItem, prelude::*};
 use workspace::{
-    Workspace,
+    Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    notifications::NotificationId,
 };
 
 use crate::status::{SessionStatus, StatusTracker};
@@ -71,8 +72,9 @@ impl SessionsPanel {
     }
 
     /// Reads each terminal's foreground process, feeds the per-terminal
-    /// `StatusTracker`, and fires a native notification when a command
-    /// finishes at or above the threshold while the window is inactive.
+    /// `StatusTracker`, and on a command finishing at or above the
+    /// threshold, notifies the user: a native notification while the
+    /// window is inactive, or an in-app toast while it's active.
     fn poll_statuses(&mut self, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -84,6 +86,7 @@ impl SessionsPanel {
             .update(cx, |_, window, _| window.is_window_active())
             .unwrap_or(true);
         let now = Instant::now();
+        let threshold = Self::notify_threshold();
 
         self.trackers
             .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
@@ -99,16 +102,28 @@ impl SessionsPanel {
                 .entry(terminal_view.entity_id())
                 .or_insert_with(StatusTracker::new);
             if let Some(finished) = tracker.update(foreground.as_deref(), now) {
-                if finished.duration >= Self::notify_threshold() && !window_active {
+                if finished.duration >= threshold {
                     let mins = finished.duration.as_secs() / 60;
                     let secs = finished.duration.as_secs() % 60;
                     let title = terminal_view.read(cx).terminal().read(cx).title(true);
-                    cx.show_system_notification(SystemNotification {
-                        tag: format!("hive-session-{}", terminal_view.entity_id()).into(),
-                        title: format!("{} finished", finished.command).into(),
-                        body: format!("{title} · {mins}m {secs}s").into(),
-                        actions: Vec::new(),
-                    });
+                    if !window_active {
+                        cx.show_system_notification(SystemNotification {
+                            tag: format!("hive-session-{}", terminal_view.entity_id()).into(),
+                            title: format!("{} finished", finished.command).into(),
+                            body: format!("{title} · {mins}m {secs}s").into(),
+                            actions: Vec::new(),
+                        });
+                    } else if let Some(workspace) = self.workspace.upgrade() {
+                        let id = NotificationId::composite::<Self>((
+                            "session-finished",
+                            terminal_view.entity_id(),
+                        ));
+                        let message =
+                            format!("{} finished · {mins}m {secs}s", finished.command);
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_toast(Toast::new(id, message).autohide(), cx);
+                        });
+                    }
                 }
             }
         }
