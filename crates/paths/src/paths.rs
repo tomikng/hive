@@ -15,7 +15,10 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+// hive: drives config/data/logs dir names. Must NOT be "Zed" or the fork shares
+// ~/.config/zed with a real Zed install — user settings there override Hive's
+// shipped defaults (e.g. the theme) and Hive would pollute Zed's state.
+pub const APP_NAME: &str = "Hive";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.
