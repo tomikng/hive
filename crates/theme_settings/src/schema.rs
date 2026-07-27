@@ -912,8 +912,8 @@ mod tests {
     use theme::StatusColorsRefinement;
 
     use super::{
-        StatusColorsContent, ThemeColorsContent, status_colors_refinement, theme_colors_refinement,
-        try_parse_color,
+        StatusColorsContent, ThemeColorsContent, ThemeFamilyContent, status_colors_refinement,
+        theme_colors_refinement, try_parse_color,
     };
 
     #[test]
@@ -1102,5 +1102,23 @@ mod tests {
             override_refinement.vim_helix_jump_label_foreground,
             Some(override_color)
         );
+    }
+
+    #[test]
+    fn hive_theme_parses_and_refines() {
+        let raw = include_str!("../../../assets/themes/hive/hive.json");
+        let family: ThemeFamilyContent =
+            serde_json::from_str(raw).expect("hive.json should deserialize as a theme family");
+
+        assert_eq!(family.name, "Hive");
+        assert_eq!(family.themes.len(), 1);
+        assert_eq!(family.themes[0].name, "Hive Dark");
+        assert_eq!(family.themes[0].appearance, theme::AppearanceContent::Dark);
+
+        // Exercises the same refinement path `load_bundled_themes` runs at startup,
+        // catching any color string that fails to parse.
+        let refined = crate::refine_theme_family(family);
+        assert_eq!(refined.themes.len(), 1);
+        assert_eq!(refined.themes[0].name, "Hive Dark");
     }
 }
