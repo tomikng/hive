@@ -1,49 +1,65 @@
-# Zed
-
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
-
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+<div align="center">
+  <img src="assets/hive-logo.svg" width="104" alt="Hive logo">
+  <h1>Hive</h1>
+  <p><strong>A terminal-first code editor for the agentic era.</strong></p>
+  <p><em>A fork of <a href="https://github.com/zed-industries/zed">Zed</a>.</em></p>
+</div>
 
 ---
 
-### Installation
+Most editors treat the terminal as a drawer at the bottom. But when you work with coding agents — Claude Code, Codex, aider — the terminal *is* the workspace, and the editor is what you open to check the agent's work.
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Hive inverts the layout: a window opens as a terminal, sessions are first-class, and the editor shows up beside them when you need it.
 
-Other platforms are not yet available:
+## What it does
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+**Sessions, not tabs.** A left rail lists your projects and the terminal sessions inside them, each with a live status dot — running, idle, or waiting for input. Run several agents across several repos and see at a glance which one needs you.
 
-### Developing Zed
+**It tells you when an agent finishes.** A native notification when a long command completes in an unfocused window; an in-app toast when the window is focused. No more polling a terminal to see if the agent is done.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+**The file tree follows your terminal.** `cd` somewhere and the right-hand tree re-roots there — it reads the filesystem directly, so it costs nothing and never restarts your language servers.
 
-### Contributing
+**Git where you're already working.** Per-file keep/undo and approve-all-and-commit in the diff view, per-session diff stats in the sidebar, plus the stash viewer and commit graph a keystroke away.
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+**Pull requests without leaving.** A read-only PR/MR viewer backed by the `gh` and `glab` CLIs — no API tokens to store, since the CLIs already handle auth.
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
+**Worktrees as a first-class move.** One shortcut creates a git worktree and drops a terminal session into it, so parallel agent work doesn't collide.
 
-### Licensing
+## Keys worth knowing
 
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
+| | |
+|---|---|
+| `cmd-t` | New terminal session |
+| `cmd-shift-n` | New git worktree + session |
+| `cmd-d` | Review uncommitted changes |
+| `cmd-e` | Open a file beside the terminal |
+| `ctrl-shift-t` | Toggle the file tree |
+| `ctrl-shift-s` | Stash viewer |
+| `ctrl-shift-h` | Commit graph |
+| `cmd-shift-r` | Saved commands (`.zed/tasks.json`) |
+| `ctrl-alt-i` | Multi-line terminal input |
 
-License information for third party dependencies must be correctly provided for CI to pass.
+## Building
 
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
+Requires Rust (the pinned toolchain installs itself), Xcode with the Metal toolchain, and CMake.
 
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
+```sh
+xcodebuild -downloadComponent MetalToolchain   # once
+cargo run -p zed                               # produces the `hive` binary
+script/bundle-mac -d                           # build Hive.app
+```
 
-## Sponsorship
+Hive keeps its own config, so it won't touch an existing Zed install:
+`~/.config/hive`, `~/Library/Application Support/Hive`, `~/Library/Logs/Hive`.
 
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
+## Status
 
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+Working, but young — expect rough edges. Shell integration emits OSC 133 and command boundaries are tracked, though block rendering isn't wired to the UI yet. GitLab support in the PR viewer is written but less tested than GitHub.
 
+Zed's built-in AI features (agent panel, inline assist, edit prediction) are disabled by default — Hive's premise is that agents run as CLI processes in your terminals.
+
+## Credit and license
+
+Hive is a fork of [Zed](https://github.com/zed-industries/zed) by Zed Industries, and essentially all of the editor — the GPUI framework, the editor core, LSP, terminal, git integration — is their work. Hive changes the shell around it.
+
+Licensed under **GPL-3.0**, inherited from Zed. See [LICENSE-GPL](LICENSE-GPL).
