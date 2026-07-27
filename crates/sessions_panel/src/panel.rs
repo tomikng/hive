@@ -369,7 +369,9 @@ impl Panel for SessionsPanel {
     }
 
     fn activation_priority(&self) -> u32 {
-        0
+        // Must be globally unique across all panels (Zed panics in debug builds on a
+        // collision). 0=agent, 1=project, 2=terminal, 3=git, 6=outline, 7=debugger.
+        4
     }
 
     fn starts_open(&self, _window: &Window, _cx: &App) -> bool {
