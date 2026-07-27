@@ -1050,6 +1050,23 @@
     // Default: project_diff
     "entry_primary_click_action": "project_diff",
   },
+  // Settings for generating git branch names for new worktrees (git::PromptCreateWorktree,
+  // bound to cmd-shift-n) using a local agent CLI.
+  "branch_namer": {
+    // Whether to ask a local agent CLI (claude, then codex) to turn a task
+    // description into a branch name. When disabled, or when no CLI is
+    // available/working, the description is slugified locally instead.
+    //
+    // Default: true
+    "enabled": true,
+    // Overrides the command used to invoke the agent CLI, split on
+    // whitespace (e.g. "codex exec"). A literal "{prompt}" token is replaced
+    // with the generated prompt; otherwise the prompt is appended as the
+    // final argument.
+    //
+    // Default: null (auto-detect claude, then codex)
+    "command": null
+  },
   "agent": {
     // Whether the inline assistant should use streaming tools, when available
     "inline_assistant_use_streaming_tools": true,

@@ -708,8 +708,10 @@
       "alt-shift-enter": "toast::RunAction",
       "cmd-shift-s": "workspace::SaveAs",
       // Hive: was workspace::NewWindow upstream; terminal-first workflow uses
-      // cmd-shift-n to create a git worktree instead (see git::CreateWorktree below).
-      "cmd-shift-n": ["git::CreateWorktree", { "branch_target": { "kind": "current_branch" } }],
+      // cmd-shift-n to create a git worktree instead. Prompts for a task
+      // description, names the branch via a local agent CLI, then creates
+      // the worktree (see git::PromptCreateWorktree / git::CreateWorktree).
+      "cmd-shift-n": "git::PromptCreateWorktree",
       "ctrl-`": "terminal_panel::Toggle",
       "cmd-1": ["workspace::ActivatePane", 0],
       "cmd-2": ["workspace::ActivatePane", 1],

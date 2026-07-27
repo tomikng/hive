@@ -318,6 +318,16 @@ pub struct CreateWorktree {
     pub branch_target: NewWorktreeBranchTarget,
 }
 
+/// Prompts for a short "what are you working on?" description, asks a local
+/// agent CLI (if one is available and enabled) to turn it into a git branch
+/// name, and creates a worktree on that branch via `CreateWorktree`. Falls
+/// back to a locally-slugified branch name, or to `CreateWorktree`'s own
+/// auto-generated name if the description is left empty.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct PromptCreateWorktree;
+
 /// Switches the workspace to an existing linked worktree.
 /// Dispatched by the unified worktree picker when the user selects an existing worktree.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Action)]

@@ -164,6 +164,8 @@ pub struct SettingsContent {
 
     pub git_panel: Option<GitPanelSettingsContent>,
 
+    pub branch_namer: Option<BranchNamerSettingsContent>,
+
     pub tabs: Option<ItemSettingsContent>,
     pub tab_bar: Option<TabBarSettingsContent>,
     pub status_bar: Option<StatusBarSettingsContent>,
@@ -753,6 +755,28 @@ pub struct GitPanelSettingsContent {
     ///
     /// Default: project_diff
     pub entry_primary_click_action: Option<GitPanelClickBehavior>,
+}
+
+/// Configuration for generating git branch names for new worktrees using a
+/// local agent CLI (`claude` or `codex`), triggered from `git::PromptCreateWorktree`.
+#[with_fallible_options]
+#[derive(Clone, PartialEq, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug)]
+pub struct BranchNamerSettingsContent {
+    /// Whether to use a local agent CLI to turn a task description into a
+    /// git branch name when creating a new worktree. When disabled, or when
+    /// no supported CLI is available, a branch name is slugified locally
+    /// from the typed description instead.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+
+    /// Overrides the command used to invoke the agent CLI, split on
+    /// whitespace, e.g. `"codex exec"`. A literal `{prompt}` token is
+    /// replaced with the generated prompt; otherwise the prompt is appended
+    /// as the final argument.
+    ///
+    /// Default: null (auto-detect `claude`, then `codex`)
+    pub command: Option<String>,
 }
 
 #[derive(

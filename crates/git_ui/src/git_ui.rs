@@ -35,6 +35,7 @@ use crate::{
 
 mod askpass_modal;
 pub mod branch_diff;
+pub mod branch_namer;
 pub mod branch_picker;
 mod commit_context_menu;
 mod commit_modal;
@@ -103,6 +104,11 @@ pub fn init(cx: &mut App) {
         workspace.register_action(
             |workspace, action: &zed_actions::CreateWorktree, window, cx| {
                 worktree_service::handle_create_worktree(workspace, action, window, None, cx);
+            },
+        );
+        workspace.register_action(
+            |workspace, _: &zed_actions::PromptCreateWorktree, window, cx| {
+                branch_namer::prompt_and_create_worktree(workspace, window, cx);
             },
         );
         workspace.register_action(
