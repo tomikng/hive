@@ -1,23 +1,21 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification,
-    WeakEntity, Window, actions, px,
+    AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
+    FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification, WeakEntity, Window,
+    actions, px,
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{Indicator, ListItem, Tooltip, prelude::*};
-use util::ResultExt;
+use ui::{Indicator, ListItem, prelude::*};
 use workspace::{
-    OpenOptions, OpenVisible, Toast, Workspace,
+    Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
     notifications::NotificationId,
 };
 
-use crate::file_tree::{self, DirState, TreeEntry};
 use crate::status::{SessionStatus, StatusTracker, is_agent};
 
 actions!(sessions_panel, [ToggleFocus, NewSession]);
@@ -37,14 +35,6 @@ pub struct SessionsPanel {
     /// fact.
     activity: HashMap<EntityId, (terminal::Point, Instant)>,
     _git_subscription: Subscription,
-    /// Root of the file tree rendered below the sessions list: the focused
-    /// terminal's cwd, falling back to the last terminal that was focused,
-    /// then the first project root. `None` when there's nothing to show it
-    /// for yet (e.g. panel just opened, no terminals exist).
-    tree_root: Option<PathBuf>,
-    last_terminal_cwd: Option<PathBuf>,
-    tree_expanded: HashSet<PathBuf>,
-    tree_cache: HashMap<PathBuf, DirState>,
 }
 
 pub fn init(cx: &mut App) {
@@ -110,10 +100,6 @@ impl SessionsPanel {
                     trackers: HashMap::default(),
                     activity: HashMap::default(),
                     _git_subscription: git_subscription,
-                    tree_root: None,
-                    last_terminal_cwd: None,
-                    tree_expanded: HashSet::default(),
-                    tree_cache: HashMap::default(),
                 }
             })
         })
@@ -134,8 +120,6 @@ impl SessionsPanel {
     /// threshold, notifies the user: a native notification while the
     /// window is inactive, or an in-app toast while it's active.
     fn poll_statuses(&mut self, cx: &mut Context<Self>) {
-        self.update_tree_root(cx);
-
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -279,185 +263,6 @@ impl SessionsPanel {
         Some((summary.count, added, deleted))
     }
 
-    /// The cwd of the terminal that's the active item in the workspace's
-    /// active pane, or `None` if the active item isn't a terminal at all
-    /// (e.g. an editor tab is focused).
-    fn focused_terminal_cwd(&self, cx: &App) -> Option<PathBuf> {
-        let workspace = self.workspace.upgrade()?;
-        let active_terminal = workspace.read(cx).active_item(cx)?.downcast::<TerminalView>()?;
-        active_terminal.read(cx).terminal().read(cx).working_directory()
-    }
-
-    /// Re-derives the file tree's root (see the `tree_root` doc comment) and,
-    /// on change, drops the stale cache/expansion state and kicks off a load
-    /// of the new root's listing. Called from `poll_statuses` rather than a
-    /// separate timer -- that loop already runs every 2s and already reads
-    /// terminal cwds.
-    fn update_tree_root(&mut self, cx: &mut Context<Self>) {
-        let focused_cwd = self.focused_terminal_cwd(cx);
-        if let Some(cwd) = focused_cwd.clone() {
-            self.last_terminal_cwd = Some(cwd);
-        }
-        let new_root = focused_cwd
-            .or_else(|| self.last_terminal_cwd.clone())
-            .or_else(|| self.sessions(cx).into_iter().next().map(|(root, _)| PathBuf::from(root)));
-
-        if new_root == self.tree_root {
-            return;
-        }
-        self.tree_root = new_root.clone();
-        self.tree_cache.clear();
-        self.tree_expanded.clear();
-        if let Some(root) = new_root {
-            self.tree_expanded.insert(root.clone());
-            self.ensure_dir_loaded(root, cx);
-        }
-    }
-
-    /// Lazily loads one directory level in the background and caches it.
-    /// No-op if a load for `path` is already in flight or already loaded --
-    /// callers that want a fresh read (e.g. a root change) clear
-    /// `tree_cache` first.
-    fn ensure_dir_loaded(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if matches!(self.tree_cache.get(&path), Some(DirState::Loading | DirState::Loaded(_))) {
-            return;
-        }
-        self.tree_cache.insert(path.clone(), DirState::Loading);
-        cx.spawn(async move |this, cx| {
-            let state = cx
-                .background_spawn({
-                    let path = path.clone();
-                    async move { file_tree::read_dir(&path) }
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.tree_cache.insert(path, state);
-                cx.notify();
-            })
-            .log_err();
-        })
-        .detach();
-    }
-
-    fn toggle_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.tree_expanded.remove(&path) {
-            cx.notify();
-            return;
-        }
-        self.tree_expanded.insert(path.clone());
-        self.ensure_dir_loaded(path, cx);
-        cx.notify();
-    }
-
-    /// The file tree rendered below the sessions list, rooted at
-    /// `self.tree_root`. `None` when there's no root yet (nothing to show).
-    fn render_tree(&self, cx: &Context<Self>) -> Option<impl IntoElement> {
-        let root = self.tree_root.clone()?;
-        let name = root
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| root.to_string_lossy().into_owned());
-        let full_path = root.to_string_lossy().into_owned();
-
-        let mut rows = v_flex();
-        for row in self.render_dir_rows(&root, 1, cx) {
-            rows = rows.child(row);
-        }
-
-        Some(
-            v_flex()
-                .mt_2()
-                .child(
-                    div()
-                        .id("tree-root-header")
-                        .px_1()
-                        .child(Label::new(name).size(LabelSize::Small).color(Color::Muted))
-                        .tooltip(Tooltip::text(full_path)),
-                )
-                .child(rows),
-        )
-    }
-
-    /// Rows for `dir`'s cached listing plus, recursively, rows for any
-    /// expanded subdirectories. Reads only `tree_cache`/`tree_expanded` --
-    /// loading is triggered from `toggle_dir`/`update_tree_root`, never here,
-    /// so this stays a cheap, side-effect-free pass over already-fetched data.
-    fn render_dir_rows(&self, dir: &Path, depth: usize, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut rows = Vec::new();
-        match self.tree_cache.get(dir) {
-            Some(DirState::Loaded(listing)) => {
-                for entry in &listing.entries {
-                    rows.push(self.render_entry_row(entry, depth, cx).into_any_element());
-                    if entry.is_dir && self.tree_expanded.contains(&entry.path) {
-                        rows.extend(self.render_dir_rows(&entry.path, depth + 1, cx));
-                    }
-                }
-                if listing.truncated {
-                    rows.push(
-                        ListItem::new(format!("tree-truncated-{}", dir.to_string_lossy()))
-                            .indent_level(depth)
-                            .child(Label::new("…").size(LabelSize::Small).color(Color::Muted))
-                            .into_any_element(),
-                    );
-                }
-            }
-            Some(DirState::Loading) => {
-                rows.push(
-                    ListItem::new(format!("tree-loading-{}", dir.to_string_lossy()))
-                        .indent_level(depth)
-                        .child(Label::new("Loading…").size(LabelSize::Small).color(Color::Muted))
-                        .into_any_element(),
-                );
-            }
-            Some(DirState::Error(message)) => {
-                rows.push(
-                    ListItem::new(format!("tree-error-{}", dir.to_string_lossy()))
-                        .indent_level(depth)
-                        .child(Label::new(message.clone()).size(LabelSize::Small).color(Color::Error))
-                        .into_any_element(),
-                );
-            }
-            None => {}
-        }
-        rows
-    }
-
-    fn render_entry_row(&self, entry: &TreeEntry, depth: usize, cx: &Context<Self>) -> impl IntoElement {
-        let path = entry.path.clone();
-        let is_dir = entry.is_dir;
-        let expanded = is_dir && self.tree_expanded.contains(&path);
-        let icon = if is_dir {
-            if expanded { IconName::FolderOpen } else { IconName::Folder }
-        } else {
-            IconName::File
-        };
-        let workspace = self.workspace.clone();
-
-        ListItem::new(entry.path.to_string_lossy().into_owned())
-            .indent_level(depth)
-            .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
-            .child(Label::new(entry.name.clone()).single_line())
-            .on_click(cx.listener(move |this, _event, window, cx| {
-                if is_dir {
-                    this.toggle_dir(path.clone(), cx);
-                    return;
-                }
-                let Some(workspace) = workspace.upgrade() else {
-                    return;
-                };
-                workspace.update(cx, |workspace, cx| {
-                    workspace
-                        .open_abs_path(
-                            path.clone(),
-                            OpenOptions { visible: Some(OpenVisible::None), ..Default::default() },
-                            window,
-                            cx,
-                        )
-                        .detach_and_log_err(cx);
-                });
-            }))
-    }
-
     fn render_session(
         &self,
         terminal_view: Entity<TerminalView>,
@@ -516,9 +321,6 @@ impl Render for SessionsPanel {
                 root = root.child(self.render_session(terminal_view, cx));
             }
         }
-        if let Some(tree) = self.render_tree(cx) {
-            root = root.child(tree);
-        }
         root
     }
 }
@@ -568,7 +370,8 @@ impl Panel for SessionsPanel {
 
     fn activation_priority(&self) -> u32 {
         // Must be globally unique across all panels (Zed panics in debug builds on a
-        // collision). 0=agent, 1=project, 2=terminal, 3=git, 6=outline, 7=debugger.
+        // collision). 0=agent, 1=project, 2=terminal, 3=git, 5=file tree, 6=outline,
+        // 7=debugger.
         4
     }
 

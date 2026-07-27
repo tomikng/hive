@@ -752,6 +752,8 @@
       "cmd-shift-m": "diagnostics::Deploy",
       "cmd-shift-e": "project_panel::ToggleFocus",
       "cmd-shift-b": "outline_panel::ToggleFocus",
+      // Hive: cwd file tree panel (right dock); ctrl-shift-t was unused.
+      "ctrl-shift-t": "file_tree_panel::ToggleFocus",
       "ctrl-shift-g": "git_panel::ToggleFocus",
       // Hive: git_panel::ActivateHistoryTab (cmd-2 within GitPanel) and stash
       // sub-actions were already bound; git graph and stash viewer had no
