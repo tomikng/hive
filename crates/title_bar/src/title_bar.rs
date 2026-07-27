@@ -291,6 +291,35 @@ impl Render for TitleBar {
             }
         }
 
+        // hive: the title bar follows whichever terminal is focused, not the
+        // fixed project root -- see `workspace::ActiveTerminalLocation`,
+        // published by `sessions_panel`'s terminal-cwd poll. When no terminal
+        // is focused (`path` is `None`) the project-derived values above are
+        // left untouched. When the cwd falls outside the project's own repo
+        // there's no real `Entity<Repository>` for it, so the branch/worktree
+        // popovers -- which need one to open the right picker -- are
+        // suppressed in favor of a plain, non-interactive label.
+        let terminal_location = workspace::ActiveTerminalLocation::get(cx);
+        if let Some(terminal_path) = terminal_location.path.as_ref() {
+            project_name = Some(
+                terminal_path
+                    .file_name()
+                    .map(|name| SharedString::from(name.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| {
+                        SharedString::from(terminal_path.to_string_lossy().into_owned())
+                    }),
+            );
+
+            let in_project_repo = repository.as_ref().is_some_and(|repo| {
+                terminal_path.starts_with(&*repo.read(cx).work_directory_abs_path)
+            });
+            if !in_project_repo {
+                repository = None;
+                linked_worktree_name = None;
+            }
+        }
+        let is_foreign_location = terminal_location.path.is_some() && repository.is_none();
+
         children.push(
             h_flex()
                 .h_full()
@@ -316,9 +345,14 @@ impl Render for TitleBar {
                         .when(render_project_items, |title_bar| {
                             title_bar
                                 .when(title_bar_settings.show_project_items, |title_bar| {
-                                    title_bar
-                                        .children(self.render_project_host(cx))
-                                        .child(self.render_project_name(project_name, window, cx))
+                                    title_bar.children(self.render_project_host(cx)).child(
+                                        self.render_project_name(
+                                            project_name,
+                                            is_foreign_location,
+                                            window,
+                                            cx,
+                                        ),
+                                    )
                                 })
                                 .when_some(
                                     repository.filter(|_| is_git_enabled),
@@ -330,6 +364,15 @@ impl Render for TitleBar {
                                         ))
                                     },
                                 )
+                                .when(is_foreign_location && is_git_enabled, |title_bar| {
+                                    title_bar.children(terminal_location.branch.clone().map(
+                                        |branch| {
+                                            Label::new(branch)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted)
+                                        },
+                                    ))
+                                })
                         })
                 })
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -783,6 +826,7 @@ impl TitleBar {
     fn render_project_name(
         &self,
         name: Option<SharedString>,
+        is_foreign_location: bool,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -795,6 +839,15 @@ impl TitleBar {
         } else {
             "Open Recent Project".to_string()
         };
+
+        // hive: a foreign (out-of-project) terminal cwd has no real project
+        // to pop the recent-projects menu open for, so show it as plain text.
+        if is_foreign_location {
+            return Label::new(display_name)
+                .size(LabelSize::Small)
+                .color(Color::Muted)
+                .into_any_element();
+        }
 
         let is_sidebar_open = self
             .multi_workspace

@@ -92,6 +92,14 @@ impl FileTreePanel {
     /// `load`.
     fn update_tree_root(&mut self, cx: &mut Context<Self>) {
         let focused_cwd = self.focused_terminal_cwd(cx);
+
+        // hive: let the title bar follow the focused terminal too. Only
+        // publish (and re-read `.git/HEAD`) when the cwd actually changed --
+        // this runs on the same 2s poll as the tree root, never on render.
+        if focused_cwd != workspace::ActiveTerminalLocation::get(cx).path {
+            workspace::ActiveTerminalLocation::set(focused_cwd.clone(), cx);
+        }
+
         if let Some(cwd) = focused_cwd.clone() {
             self.last_terminal_cwd = Some(cwd);
         }

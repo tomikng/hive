@@ -8611,6 +8611,132 @@ impl GlobalAnyActiveCall {
     }
 }
 
+/// The folder (and, if it's a git repo, branch) of whichever terminal is
+/// currently focused, shared with `title_bar` via a global since that crate
+/// can't depend on `terminal_view`. Populated by `sessions_panel`'s existing
+/// 2s poll of the focused terminal's cwd -- never read or written from a
+/// render path. `None` fields mean "unknown" / "no terminal focused";
+/// consumers fall back to the project's own values.
+#[derive(Clone, Default)]
+pub struct ActiveTerminalLocation {
+    pub path: Option<PathBuf>,
+    pub branch: Option<SharedString>,
+}
+
+impl Global for ActiveTerminalLocation {}
+
+impl ActiveTerminalLocation {
+    pub fn get(cx: &App) -> ActiveTerminalLocation {
+        cx.try_global::<ActiveTerminalLocation>()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn set(path: Option<PathBuf>, cx: &mut App) {
+        let branch = path.as_deref().and_then(read_git_branch);
+        cx.set_global(ActiveTerminalLocation { path, branch });
+    }
+}
+
+/// Reads the current branch name for the git repo (if any) containing
+/// `path`, without shelling out. Walks up from `path` looking for `.git`,
+/// which may be a directory or -- for a linked worktree or submodule -- a
+/// file containing `gitdir: <path>`, then reads `HEAD` directly. Returns
+/// `None` for a non-repo, an unreadable path, or any parse failure; never
+/// panics.
+pub fn read_git_branch(path: &Path) -> Option<SharedString> {
+    let dot_git = path
+        .ancestors()
+        .map(|ancestor| ancestor.join(".git"))
+        .find(|candidate| candidate.exists())?;
+
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let linked = contents.trim().strip_prefix("gitdir:")?.trim();
+        let linked = PathBuf::from(linked);
+        if linked.is_absolute() {
+            linked
+        } else {
+            dot_git.parent()?.join(linked)
+        }
+    };
+
+    let head_contents = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_contents = head_contents.trim();
+    if let Some(branch) = head_contents.strip_prefix("ref: refs/heads/") {
+        Some(SharedString::from(branch.to_string()))
+    } else if !head_contents.is_empty() {
+        let short_sha: String = head_contents.chars().take(7).collect();
+        Some(SharedString::from(format!("detached ({short_sha})")))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod read_git_branch_tests {
+    use super::read_git_branch;
+
+    #[test]
+    fn no_git_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_git_branch(dir.path()), None);
+    }
+
+    #[test]
+    fn plain_repo_on_a_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(read_git_branch(dir.path()).as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn detached_head_shows_short_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "deadbeefcafef00d\n").unwrap();
+        assert_eq!(
+            read_git_branch(dir.path()).as_deref(),
+            Some("detached (deadbee)")
+        );
+    }
+
+    #[test]
+    fn linked_worktree_dot_git_is_a_file() {
+        let root = tempfile::tempdir().unwrap();
+        let real_git_dir = root.path().join("real-gitdir");
+        std::fs::create_dir(&real_git_dir).unwrap();
+        std::fs::write(real_git_dir.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
+
+        let worktree = root.path().join("linked-worktree");
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", real_git_dir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(read_git_branch(&worktree).as_deref(), Some("feature"));
+    }
+
+    #[test]
+    fn nested_path_walks_up_to_find_dot_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let nested = dir.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(read_git_branch(&nested).as_deref(), Some("main"));
+    }
+}
+
 /// Workspace-local view of a remote participant's location.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParticipantLocation {
