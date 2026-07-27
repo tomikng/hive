@@ -1264,18 +1264,23 @@ fn reveal_terminal_cwd(
                 .on_click("Open as Project", move |_window, cx| {
                     toast_workspace
                         .update_in(cx, |workspace, window, cx| {
-                            workspace
-                                .open_paths(
-                                    vec![open_cwd.clone()],
-                                    OpenOptions {
-                                        visible: Some(OpenVisible::All),
-                                        ..Default::default()
-                                    },
-                                    None,
-                                    window,
-                                    cx,
-                                )
-                                .detach();
+                            let open = workspace.open_paths(
+                                vec![open_cwd.clone()],
+                                OpenOptions {
+                                    visible: Some(OpenVisible::All),
+                                    ..Default::default()
+                                },
+                                None,
+                                window,
+                                cx,
+                            );
+                            cx.spawn(async move |_, _cx| {
+                                for result in open.await.into_iter().flatten() {
+                                    result.log_err();
+                                }
+                                anyhow::Ok(())
+                            })
+                            .detach_and_log_err(cx);
                         })
                         .ok();
                 }),

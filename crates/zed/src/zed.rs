@@ -904,6 +904,30 @@ async fn initialize_agent_panel(
     anyhow::Ok(())
 }
 
+/// Opens a terminal in the workspace's center pane. Falls back to an empty
+/// editor buffer when the project doesn't support terminals (remote/collab
+/// projects), so those windows aren't left blank.
+pub(crate) fn open_terminal_or_fallback_editor(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let cwd = terminal_view::default_working_directory(workspace, cx);
+    let open_terminal =
+        TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
+            project.create_terminal_shell(cwd, cx)
+        });
+    cx.spawn_in(window, async move |workspace, cx| {
+        if open_terminal.await.is_err() {
+            workspace.update_in(cx, |workspace, window, cx| {
+                Editor::new_file(workspace, &Default::default(), window, cx);
+            })?;
+        }
+        anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
 fn register_actions(
     app_state: Arc<AppState>,
     workspace: &mut Workspace,
@@ -1264,21 +1288,7 @@ fn register_actions(
                     cx,
                     |workspace, window, cx| {
                         cx.activate(true);
-                        // Create buffer synchronously to avoid flicker
-                        let project = workspace.project().clone();
-                        let buffer = project.update(cx, |project, cx| {
-                            project.create_local_buffer("", None, true, cx)
-                        });
-                        let editor = cx.new(|cx| {
-                            Editor::for_buffer(buffer, Some(project), window, cx)
-                        });
-                        workspace.add_item_to_active_pane(
-                            Box::new(editor),
-                            None,
-                            true,
-                            window,
-                            cx,
-                        );
+                        open_terminal_or_fallback_editor(workspace, window, cx);
                     },
                 )
                 .detach();
@@ -1307,9 +1317,7 @@ fn register_actions(
                     Default::default(),
                     app_state.clone(),
                     cx,
-                    |workspace, window, cx| {
-                        Editor::new_file(workspace, &Default::default(), window, cx)
-                    },
+                    open_terminal_or_fallback_editor,
                 )
                 .detach_and_log_err(cx);
             }
