@@ -753,6 +753,11 @@ fn main() {
         // global. call::init only registers the ActiveCall global; with channel/collab_ui stripped
         // it stays unused and shows no collab UI.
         call::init(app_state.client.clone(), app_state.user_store.clone(), cx);
+        // hive: notifications::init -> NotificationStore::new calls ChannelStore::global
+        // (try_global().unwrap()), so channel::init must run first to set that global.
+        // channel::init only sets up the ChannelStore data layer; with collab_ui stripped and
+        // sign-in stripped the client never connects, so it stays idle with no UI.
+        channel::init(&app_state.client, app_state.user_store.clone(), cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         title_bar::init(cx);
         // hive: stripped collab_ui::init(...)
