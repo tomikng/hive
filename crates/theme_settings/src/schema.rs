@@ -1112,13 +1112,13 @@ mod tests {
 
         assert_eq!(family.name, "Hive");
         assert_eq!(family.themes.len(), 1);
-        assert_eq!(family.themes[0].name, "Hive Dark");
+        assert_eq!(family.themes[0].name, "Hive Carbon");
         assert_eq!(family.themes[0].appearance, theme::AppearanceContent::Dark);
 
         // Exercises the same refinement path `load_bundled_themes` runs at startup,
         // catching any color string that fails to parse.
         let refined = crate::refine_theme_family(family);
         assert_eq!(refined.themes.len(), 1);
-        assert_eq!(refined.themes[0].name, "Hive Dark");
+        assert_eq!(refined.themes[0].name, "Hive Carbon");
     }
 }

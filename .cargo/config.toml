@@ -1,6 +1,10 @@
 [build]
 # v0 mangling scheme provides more detailed backtraces around closures
 rustflags = ["-C", "symbol-mangling-version=v0", "--cfg", "tokio_unstable"]
+# hive: the incremental cache grows to ~38 GB on this tree and has filled the
+# disk mid-build more than once. Rebuilds are slower without it; that beats
+# ENOSPC. Drop this line if you're building on a machine with room to spare.
+incremental = false
 
 [alias]
 xtask = "run --package xtask --"

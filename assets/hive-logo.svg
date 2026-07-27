@@ -1,0 +1,31 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Hive logo">
+  <defs>
+    <linearGradient id="hive-edge" x1="24" y1="10" x2="104" y2="118" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d8caff"/>
+      <stop offset="0.55" stop-color="#c4b5fd"/>
+      <stop offset="1" stop-color="#8b7ad6"/>
+    </linearGradient>
+    <linearGradient id="hive-fill" x1="64" y1="12" x2="64" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#17171c"/>
+      <stop offset="1" stop-color="#0b0b0e"/>
+    </linearGradient>
+  </defs>
+
+  <!-- hexagon: the hive cell -->
+  <path d="M64 8 L112 36 L112 92 L64 120 L16 92 L16 36 Z"
+        fill="url(#hive-fill)"
+        stroke="url(#hive-edge)"
+        stroke-width="6"
+        stroke-linejoin="round"/>
+
+  <!-- terminal prompt: the chevron -->
+  <path d="M46 50 L62 64 L46 78"
+        stroke="#c4b5fd"
+        stroke-width="7"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        fill="none"/>
+
+  <!-- terminal cursor -->
+  <rect x="70" y="71" width="20" height="7" rx="3.5" fill="#86efac"/>
+</svg>

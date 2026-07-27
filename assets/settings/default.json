@@ -9,7 +9,7 @@
   "theme": {
     "mode": "system",
     "light": "One Light",
-    "dark": "Hive Dark",
+    "dark": "Hive Carbon",
   },
   // The density of the UI. Hive defaults to "compact" for a
   // terminal-first, information-dense chrome.
