@@ -16,7 +16,7 @@ use gpui::{
 };
 use menu;
 use persistence::TerminalDb;
-use project::{Project, ProjectEntryId, search::SearchQuery};
+use project::{Event as ProjectEvent, Project, ProjectEntryId, search::SearchQuery};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
@@ -49,11 +49,12 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
-    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, OpenOptions,
+    OpenVisible, Pane, Toast, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
+    notifications::NotificationId,
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -152,6 +153,7 @@ pub struct TerminalView {
     blinking_terminal_enabled: bool,
     needs_serialize: bool,
     custom_title: Option<String>,
+    last_revealed_cwd: Option<PathBuf>,
     hover: Option<HoverTarget>,
     hover_tooltip_update: Task<()>,
     workspace_id: Option<WorkspaceId>,
@@ -309,6 +311,7 @@ impl TerminalView {
             scroll_handle,
             needs_serialize: false,
             custom_title: None,
+            last_revealed_cwd: None,
             ime_state: None,
             self_handle: cx.entity().downgrade(),
             rename_editor: None,
@@ -1222,6 +1225,66 @@ fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
     }
 }
 
+/// Reveals `cwd` in the project panel if it's inside the project's worktrees;
+/// otherwise offers a toast to open it as a new project folder. Never re-roots
+/// the project (no worktree creation/removal) — see p5-task-1-brief.md.
+fn reveal_terminal_cwd(
+    project: &WeakEntity<Project>,
+    workspace: &WeakEntity<Workspace>,
+    cwd: PathBuf,
+    cx: &mut Context<TerminalView>,
+) {
+    let Ok(entry_id) = project.read_with(cx, |project, cx| {
+        let project_path = project.project_path_for_absolute_path(&cwd, cx)?;
+        project
+            .entry_for_path(&project_path, cx)
+            .map(|entry| entry.id)
+    }) else {
+        return;
+    };
+
+    if let Some(entry_id) = entry_id {
+        project
+            .update(cx, |_, cx| {
+                cx.emit(ProjectEvent::RevealInProjectPanel(entry_id))
+            })
+            .ok();
+        return;
+    }
+
+    let toast_workspace = workspace.clone();
+    let open_cwd = cwd.clone();
+    workspace
+        .update(cx, |workspace, cx| {
+            workspace.show_toast(
+                Toast::new(
+                    NotificationId::named("terminal-view-cwd-outside-project".into()),
+                    format!("Terminal is in {}", cwd.display()),
+                )
+                .on_click("Open as Project", move |_window, cx| {
+                    toast_workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace
+                                .open_paths(
+                                    vec![open_cwd.clone()],
+                                    OpenOptions {
+                                        visible: Some(OpenVisible::All),
+                                        ..Default::default()
+                                    },
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .detach();
+                        })
+                        .ok();
+                }),
+                cx,
+            );
+        })
+        .ok();
+}
+
 fn subscribe_for_terminal_events(
     terminal: &Entity<Terminal>,
     workspace: WeakEntity<Workspace>,
@@ -1278,6 +1341,23 @@ fn subscribe_for_terminal_events(
 
                 Event::TitleChanged => {
                     cx.emit(ItemEvent::UpdateTab);
+
+                    // Only the focused terminal drives the project panel; a background
+                    // terminal `cd`-ing around shouldn't steal focus or reveal anything.
+                    if terminal_view.focus_handle.is_focused(window) {
+                        let cwd = terminal.read(cx).working_directory();
+                        if cwd != terminal_view.last_revealed_cwd {
+                            terminal_view.last_revealed_cwd = cwd.clone();
+                            if let Some(cwd) = cwd {
+                                reveal_terminal_cwd(
+                                    &terminal_view.project,
+                                    &terminal_view.workspace,
+                                    cwd,
+                                    cx,
+                                );
+                            }
+                        }
+                    }
                 }
 
                 Event::NewNavigationTarget(maybe_navigation_target) => {
