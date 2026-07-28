@@ -240,6 +240,34 @@ pub fn generate_branch_name(description: String, cx: &App) -> Task<String> {
     })
 }
 
+/// Runs the configured agent CLI with an arbitrary `prompt` and returns its
+/// trimmed stdout, or `None` when no provider is available or it fails.
+/// Shares the provider chain (and the `branch_namer.command` override) with
+/// branch naming; the sessions panel uses it to auto-title agent sessions.
+pub fn generate_agent_text(prompt: String, cx: &App) -> Task<Option<String>> {
+    let settings = BranchNamerSettings::get_global(cx).clone();
+    if !settings.enabled {
+        return Task::ready(None);
+    }
+    let executor = cx.background_executor().clone();
+    cx.background_spawn(async move {
+        for (program, args) in candidate_commands(&settings.command, &prompt) {
+            match run_provider(&program, &args, &executor).await {
+                Ok(stdout) => {
+                    let text = stdout.trim().to_string();
+                    return (!text.is_empty()).then_some(text);
+                }
+                Err(ProviderError::NotFound) => continue,
+                Err(error) => {
+                    log::debug!("branch_namer: agent text via `{program}` failed ({error})");
+                    return None;
+                }
+            }
+        }
+        None
+    })
+}
+
 /// The provider commands to try, in order. Each is `(program, args)`, where
 /// `args` already has the prompt substituted in.
 fn candidate_commands(

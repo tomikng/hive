@@ -53,6 +53,9 @@ pub struct SessionsPanel {
     /// cwd → enclosing repo root, so the `.git` walk runs once per cwd
     /// rather than on every poll.
     repo_root_cache: HashMap<PathBuf, Option<PathBuf>>,
+    /// Terminals we've already tried to auto-title, successful or not — one
+    /// agent-CLI call per session, ever.
+    naming_attempted: HashSet<EntityId>,
     _git_subscription: Subscription,
 }
 
@@ -128,6 +131,7 @@ impl SessionsPanel {
                     activity: HashMap::default(),
                     auto_attached_repos: HashMap::default(),
                     repo_root_cache: HashMap::default(),
+                    naming_attempted: HashSet::default(),
                     _git_subscription: git_subscription,
                 }
             })
@@ -268,6 +272,46 @@ impl SessionsPanel {
                     .unseen
                     .remove(&terminal_id);
             }
+
+            // Auto-title agent sessions: once the agent has run long enough
+            // for the transcript to show what it's doing, ask the agent CLI
+            // for a short label. One attempt per terminal, and never over a
+            // title the user set themselves.
+            if let SessionStatus::Running { command, since } = &new_status
+                && is_agent(command)
+                && terminal_view.read(cx).custom_title().is_none()
+                && now.saturating_duration_since(*since) >= Duration::from_secs(20)
+                && self.naming_attempted.insert(terminal_id)
+            {
+                let transcript = terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .last_n_non_empty_lines(30)
+                    .join("\n");
+                let prompt = format!(
+                    "This is a snippet of a coding agent session transcript:\n\n{transcript}\n\n\
+                     Reply with ONLY a 2-4 word title describing what this session is working \
+                     on. No quotes, no punctuation, no explanation."
+                );
+                let generate = git_ui::branch_namer::generate_agent_text(prompt, cx);
+                let terminal_view = terminal_view.clone();
+                cx.spawn(async move |_, cx| {
+                    if let Some(text) = generate.await {
+                        let mut title =
+                            text.lines().next().unwrap_or_default().trim().to_string();
+                        title.truncate(40);
+                        if !title.is_empty() {
+                            terminal_view.update(cx, |terminal_view, cx| {
+                                terminal_view.set_custom_title(Some(title), cx);
+                            });
+                        }
+                    }
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+
             cx.default_global::<SharedSessionState>()
                 .statuses
                 .insert(terminal_id, new_status);
