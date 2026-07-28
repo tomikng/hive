@@ -59,6 +59,10 @@ pub struct SessionsPanel {
     /// sticky until the terminal is focused, so this gives one reaction per
     /// ring instead of one per poll.
     belled: HashSet<EntityId>,
+    /// Per-terminal bell subscriptions so a ring re-runs the poll
+    /// immediately — spinner, dot and notification all flip at ring time
+    /// instead of up to one poll interval later.
+    bell_subscriptions: HashMap<EntityId, Subscription>,
     _git_subscription: Subscription,
 }
 
@@ -150,6 +154,7 @@ impl SessionsPanel {
                     repo_root_cache: HashMap::default(),
                     naming_attempted: HashSet::default(),
                     belled: HashSet::default(),
+                    bell_subscriptions: HashMap::default(),
                     _git_subscription: git_subscription,
                 }
             })
@@ -208,6 +213,7 @@ impl SessionsPanel {
         }
         self.trackers.retain(|id, _| live_ids.contains(id));
         self.activity.retain(|id, _| live_ids.contains(id));
+        self.bell_subscriptions.retain(|id, _| live_ids.contains(id));
 
         let cwds: Vec<PathBuf> = terminals
             .iter()
@@ -218,6 +224,20 @@ impl SessionsPanel {
         self.follow_terminal_repos(&cwds, cx);
 
         for terminal_view in terminals {
+            // A ring re-runs this whole pass immediately, so the spinner,
+            // attention dot and notification flip at ring time instead of up
+            // to one poll interval later.
+            self.bell_subscriptions
+                .entry(terminal_view.entity_id())
+                .or_insert_with(|| {
+                    let terminal = terminal_view.read(cx).terminal().clone();
+                    cx.subscribe(&terminal, |this, _terminal, event, cx| {
+                        if matches!(event, terminal::Event::Bell) {
+                            this.poll_statuses(cx);
+                        }
+                    })
+                });
+
             let terminal = terminal_view.read(cx).terminal().read(cx);
             let foreground = terminal.foreground_process_command_name();
             let content_digest = {

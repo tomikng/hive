@@ -1210,10 +1210,26 @@ impl PickerDelegate for RecentProjectsDelegate {
                                             .is_none();
                                         if is_empty {
                                             workspace.update(cx, |workspace, cx| {
-                                                let cwd =
-                                                    terminal_view::default_working_directory(
-                                                        workspace, cx,
-                                                    );
+                                                // The session's root, not the
+                                                // settings default — with no
+                                                // active item yet the default
+                                                // resolves to $HOME.
+                                                let cwd = workspace
+                                                    .project()
+                                                    .read(cx)
+                                                    .visible_worktrees(cx)
+                                                    .next()
+                                                    .map(|worktree| {
+                                                        worktree
+                                                            .read(cx)
+                                                            .abs_path()
+                                                            .to_path_buf()
+                                                    })
+                                                    .or_else(|| {
+                                                        terminal_view::default_working_directory(
+                                                            workspace, cx,
+                                                        )
+                                                    });
                                                 terminal_view::terminal_panel::TerminalPanel::add_center_terminal(
                                                     workspace,
                                                     window,
