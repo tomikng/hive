@@ -367,9 +367,18 @@ impl Render for TitleBar {
                                 .when(is_foreign_location && is_git_enabled, |title_bar| {
                                     title_bar.children(terminal_location.branch.clone().map(
                                         |branch| {
-                                            Label::new(branch)
-                                                .size(LabelSize::Small)
-                                                .color(Color::Muted)
+                                            h_flex()
+                                                .gap_1()
+                                                .child(
+                                                    Icon::new(IconName::GitBranch)
+                                                        .size(IconSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                                .child(
+                                                    Label::new(branch)
+                                                        .size(LabelSize::Small)
+                                                        .color(Color::Muted),
+                                                )
                                         },
                                     ))
                                 })
@@ -843,9 +852,18 @@ impl TitleBar {
         // hive: a foreign (out-of-project) terminal cwd has no real project
         // to pop the recent-projects menu open for, so show it as plain text.
         if is_foreign_location {
-            return Label::new(display_name)
-                .size(LabelSize::Small)
-                .color(Color::Muted)
+            return h_flex()
+                .gap_1()
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(display_name)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
                 .into_any_element();
         }
 

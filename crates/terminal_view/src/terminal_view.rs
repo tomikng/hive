@@ -52,7 +52,8 @@ use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, OpenOptions,
     OpenVisible, Pane, Toast, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
-        HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
+        HighlightedText, Item, ItemEvent, ItemSettings, SerializableItem, TabContentParams,
+        TabTooltipContent,
     },
     notifications::NotificationId,
     register_serializable_item,
@@ -1688,6 +1689,12 @@ impl Item for TerminalView {
                     .into_any_element()
             }
         }))))
+    }
+
+    fn tab_icon(&self, _window: &Window, cx: &App) -> Option<Icon> {
+        ItemSettings::get_global(cx)
+            .file_icons
+            .then(|| Icon::new(IconName::Terminal))
     }
 
     fn tab_content(&self, params: TabContentParams, _window: &Window, cx: &App) -> AnyElement {
