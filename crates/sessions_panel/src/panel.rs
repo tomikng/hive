@@ -9,7 +9,7 @@ use gpui::{
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{Indicator, ListItem, prelude::*};
+use ui::{Indicator, ListItem, Tooltip, prelude::*};
 use workspace::{
     Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -244,12 +244,21 @@ impl SessionsPanel {
 
         self.repo_root_cache.retain(|cwd, _| cwds.contains(cwd));
         for cwd in cwds {
+            // A terminal's cwd can be sampled mid-spawn as an empty/relative
+            // path; `"".join(".git")` would then resolve against the *app
+            // process's* cwd and attach garbage (seen live: attached "").
+            if !cwd.is_absolute() {
+                continue;
+            }
             let root = self
                 .repo_root_cache
                 .entry(cwd.clone())
                 .or_insert_with(|| repo_root_for(cwd))
                 .clone();
             let Some(root) = root else { continue };
+            if !root.is_absolute() {
+                continue;
+            }
             if let Some(last_seen) = self.auto_attached_repos.get_mut(&root) {
                 *last_seen = now;
                 continue;
@@ -424,9 +433,39 @@ impl SessionsPanel {
             SessionStatus::Idle => Indicator::dot().color(Color::Hidden),
         };
         let workspace = self.workspace.clone();
+        let close_workspace = self.workspace.clone();
+        let close_terminal_view = terminal_view.clone();
         ListItem::new(("session", terminal_view.entity_id()))
             .start_slot(indicator)
             .child(Label::new(title).single_line())
+            .end_slot_on_hover(
+                IconButton::new(
+                    ("close-session", terminal_view.entity_id()),
+                    IconName::Close,
+                )
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .tooltip(Tooltip::text("Close Session"))
+                .on_click(cx.listener(move |_this, _event, window, cx| {
+                    cx.stop_propagation();
+                    let Some(workspace) = close_workspace.upgrade() else {
+                        return;
+                    };
+                    workspace.update(cx, |workspace, cx| {
+                        if let Some(pane) = workspace.pane_for(&close_terminal_view) {
+                            pane.update(cx, |pane, cx| {
+                                pane.close_item_by_id(
+                                    close_terminal_view.entity_id(),
+                                    workspace::SaveIntent::Close,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .detach_and_log_err(cx);
+                        }
+                    });
+                })),
+            )
             .on_click(cx.listener(move |_this, _event, window, cx| {
                 if let Some(workspace) = workspace.upgrade() {
                     workspace.update(cx, |workspace, cx| {
