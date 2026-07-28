@@ -1195,7 +1195,40 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 })
                                 .log_err()
                             {
-                                task.detach_and_log_err(cx);
+                                // hive: terminal-first for fresh session
+                                // workspaces. Runs after the open resolves —
+                                // and item restoration with it — so reopened
+                                // projects keep their restored sessions and
+                                // only truly empty workspaces get a terminal.
+                                cx.spawn(async move |cx| {
+                                    let workspace = task.await?;
+                                    handle.update(cx, |_, window, cx| {
+                                        let is_empty = workspace
+                                            .read(cx)
+                                            .items(cx)
+                                            .next()
+                                            .is_none();
+                                        if is_empty {
+                                            workspace.update(cx, |workspace, cx| {
+                                                let cwd =
+                                                    terminal_view::default_working_directory(
+                                                        workspace, cx,
+                                                    );
+                                                terminal_view::terminal_panel::TerminalPanel::add_center_terminal(
+                                                    workspace,
+                                                    window,
+                                                    cx,
+                                                    move |project, cx| {
+                                                        project.create_terminal_shell(cwd, cx)
+                                                    },
+                                                )
+                                                .detach_and_log_err(cx);
+                                            });
+                                        }
+                                    })?;
+                                    anyhow::Ok(())
+                                })
+                                .detach_and_log_err(cx);
                             }
                         }
                     });
