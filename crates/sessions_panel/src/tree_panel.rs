@@ -96,7 +96,25 @@ impl FileTreePanel {
         // hive: let the title bar follow the focused terminal too. Only
         // publish (and re-read `.git/HEAD`) when the cwd actually changed --
         // this runs on the same 2s poll as the tree root, never on render.
-        if focused_cwd != workspace::ActiveTerminalLocation::get(cx).path {
+        // Every workspace has its own tree panel on this same poll, but the
+        // location is a window-global: only the ACTIVE workspace's panel may
+        // publish, or background sessions clobber the title bar every poll
+        // (seen as the branch/worktree flickering in and out).
+        let workspace_is_active = self
+            .workspace
+            .upgrade()
+            .map(|workspace| {
+                workspace
+                    .read(cx)
+                    .multi_workspace()
+                    .and_then(|multi_workspace| multi_workspace.upgrade())
+                    .map(|multi_workspace| multi_workspace.read(cx).workspace() == &workspace)
+                    .unwrap_or(true)
+            })
+            .unwrap_or(false);
+        if workspace_is_active
+            && focused_cwd != workspace::ActiveTerminalLocation::get(cx).path
+        {
             workspace::ActiveTerminalLocation::set(focused_cwd.clone(), cx);
         }
 
