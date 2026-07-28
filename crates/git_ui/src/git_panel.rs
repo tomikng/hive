@@ -2178,22 +2178,32 @@ impl GitPanel {
                         TrashCancel::Trash => {}
                         TrashCancel::Cancel => return Ok(()),
                     }
-                    let task = workspace.update(cx, |workspace, cx| {
-                        workspace
-                            .project()
-                            .update(cx, |project, cx| project.trash_file(path.clone(), cx))
+                    let (task, fallback) = workspace.update(cx, |workspace, cx| {
+                        workspace.project().update(cx, |project, cx| {
+                            (
+                                project.trash_file(path.clone(), cx),
+                                project.absolute_path(&path, cx),
+                            )
+                        })
                     })?;
                     // hive: `trash_file` yields None when the path has no
-                    // worktree entry (e.g. the file lives under a scan
-                    // exclusion). Silently succeeding there makes the Trash
-                    // button look dead — report it instead.
+                    // worktree entry — which is the normal case for files
+                    // inside gitignored directories, since those aren't
+                    // scanned. Trash them by absolute path instead of
+                    // silently doing nothing (which made the button look
+                    // dead).
                     match task {
-                        Some(task) => task.await?,
-                        None => anyhow::bail!(
-                            "{} is not part of a scanned worktree, so Hive can't trash it",
-                            path.path.display(PathStyle::local())
-                        ),
-                    };
+                        Some(task) => {
+                            task.await?;
+                        }
+                        None => {
+                            let abs_path = fallback.context(
+                                "could not resolve an absolute path for this file",
+                            )?;
+                            let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx))?;
+                            fs.trash(&abs_path, Default::default()).await?;
+                        }
+                    }
                     Ok(())
                 })
                 .detach_and_prompt_err(
@@ -2372,18 +2382,29 @@ impl GitPanel {
                 TrashCancel::Trash => {}
                 TrashCancel::Cancel => return Ok(()),
             }
-            let tasks = workspace.update(cx, |workspace, cx| {
-                to_delete
-                    .iter()
-                    .filter_map(|entry| {
-                        workspace.project().update(cx, |project, cx| {
-                            let project_path = active_repo
-                                .read(cx)
-                                .repo_path_to_project_path(&entry.repo_path, cx)?;
-                            project.trash_file(project_path, cx)
-                        })
-                    })
-                    .collect::<Vec<_>>()
+            // hive: entries with no worktree entry (normal for files inside
+            // gitignored directories, which aren't scanned) yield no task.
+            // The old `filter_map` dropped them silently and reported
+            // success while leaving the files on disk — fall back to
+            // trashing by absolute path.
+            let (tasks, fallbacks) = workspace.update(cx, |workspace, cx| {
+                let mut tasks = Vec::new();
+                let mut fallbacks = Vec::new();
+                for entry in to_delete.iter() {
+                    workspace.project().update(cx, |project, cx| {
+                        let Some(project_path) = active_repo
+                            .read(cx)
+                            .repo_path_to_project_path(&entry.repo_path, cx)
+                        else {
+                            return;
+                        };
+                        match project.trash_file(project_path.clone(), cx) {
+                            Some(task) => tasks.push(task),
+                            None => fallbacks.extend(project.absolute_path(&project_path, cx)),
+                        }
+                    });
+                }
+                (tasks, fallbacks)
             })?;
             let to_unstage = to_delete
                 .into_iter()
@@ -2392,6 +2413,12 @@ impl GitPanel {
             this.update(cx, |this, cx| this.change_file_stage(false, to_unstage, cx))?;
             for task in tasks {
                 task.await?;
+            }
+            if !fallbacks.is_empty() {
+                let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx))?;
+                for abs_path in fallbacks {
+                    fs.trash(&abs_path, Default::default()).await?;
+                }
             }
             Ok(())
         })
