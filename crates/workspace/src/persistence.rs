@@ -2173,6 +2173,36 @@ impl WorkspaceDb {
         Ok(self.recent_project_workspaces(fs).await?.into_iter().next())
     }
 
+    /// Most recent local workspace, including terminal-only windows with no
+    /// folders attached — `last_workspace` skips those. Hive uses this as
+    /// the restore fallback when last-session restore finds nothing (the
+    /// window was closed before quitting, or the session pointer was
+    /// overwritten by another instance).
+    pub async fn last_workspace_including_empty(
+        &self,
+        fs: &dyn Fs,
+    ) -> Result<Option<RecentWorkspace>> {
+        for (id, paths, identity_paths_hint, remote_connection_id, _session_id, timestamp) in
+            self.recent_workspaces()?
+        {
+            if remote_connection_id.is_some() || contains_wsl_path(&paths) {
+                continue;
+            }
+            if paths.paths().is_empty()
+                || Self::all_paths_exist_with_a_directory(paths.paths(), fs).await
+            {
+                return Ok(Some(RecentWorkspace {
+                    workspace_id: id,
+                    location: SerializedWorkspaceLocation::Local,
+                    identity_paths: identity_paths_hint.unwrap_or_else(|| paths.clone()),
+                    paths,
+                    timestamp,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     // Returns the locations of the workspaces that were still opened when the last
     // session was closed (i.e. when Zed was quit).
     // If `last_session_window_order` is provided, the returned locations are ordered

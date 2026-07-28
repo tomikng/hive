@@ -9765,6 +9765,19 @@ pub async fn last_opened_workspace_location(
         .map(|workspace| (workspace.workspace_id, workspace.location, workspace.paths))
 }
 
+/// Like [`last_opened_workspace_location`], but also returns terminal-only
+/// workspaces that have no folders attached.
+pub async fn last_opened_workspace_location_including_empty(
+    db: &WorkspaceDb,
+    fs: &dyn fs::Fs,
+) -> Option<(WorkspaceId, SerializedWorkspaceLocation, PathList)> {
+    db.last_workspace_including_empty(fs)
+        .await
+        .log_err()
+        .flatten()
+        .map(|workspace| (workspace.workspace_id, workspace.location, workspace.paths))
+}
+
 pub async fn last_session_workspace_locations(
     db: &WorkspaceDb,
     last_session_id: &str,

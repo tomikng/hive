@@ -1608,6 +1608,28 @@ pub(crate) async fn restorable_workspace_locations(
                 .await
                 .filter(|locations| !locations.is_empty());
 
+                // The previous session can legitimately end with zero
+                // restorable windows: the user closed the window before
+                // quitting (close detaches a workspace from the session), or
+                // another instance overwrote the session pointer. Don't come
+                // up blank — reopen the most recent workspace, including
+                // terminal-only ones, so sessions and their cwds survive.
+                if locations.is_none() {
+                    locations = workspace::last_opened_workspace_location_including_empty(
+                        &db,
+                        app_state.fs.as_ref(),
+                    )
+                    .await
+                    .map(|(workspace_id, location, paths)| {
+                        vec![SessionWorkspace {
+                            workspace_id,
+                            location,
+                            paths,
+                            window_id: None,
+                        }]
+                    });
+                }
+
                 // Since last_session_window_order returns the windows ordered front-to-back
                 // we need to open the window that was frontmost last.
                 if ordered && let Some(locations) = locations.as_mut() {
