@@ -18,7 +18,7 @@ use workspace::{
     notifications::NotificationId,
 };
 
-use crate::status::{SessionStatus, StatusTracker, is_agent};
+use crate::status::{NEEDS_INPUT_QUIET_THRESHOLD, SessionStatus, StatusTracker, is_agent};
 
 actions!(sessions_panel, [ToggleFocus, NewSession]);
 
@@ -55,6 +55,10 @@ pub struct SessionsPanel {
     /// Terminals we've already tried to auto-title, successful or not — one
     /// agent-CLI call per session, ever.
     naming_attempted: HashSet<EntityId>,
+    /// Terminals whose current bell we've already reacted to. `has_bell` is
+    /// sticky until the terminal is focused, so this gives one reaction per
+    /// ring instead of one per poll.
+    belled: HashSet<EntityId>,
     _git_subscription: Subscription,
 }
 
@@ -145,6 +149,7 @@ impl SessionsPanel {
                     auto_attached_repos: HashMap::default(),
                     repo_root_cache: HashMap::default(),
                     naming_attempted: HashSet::default(),
+                    belled: HashSet::default(),
                     _git_subscription: git_subscription,
                 }
             })
@@ -232,6 +237,22 @@ impl SessionsPanel {
             let quiet_for = now.saturating_duration_since(last_activity.1);
             let agent = foreground.as_deref().is_some_and(is_agent);
 
+            // The terminal bell is the deterministic done/needs-attention
+            // signal (Claude Code and friends ring it; Warp relies on the
+            // same convention) — treat a ring as instantly quiet so the
+            // status flips without waiting out the heuristic, and react once
+            // per ring (`has_bell` stays set until the terminal is focused).
+            let bell = terminal_view.read(cx).has_bell();
+            let bell_edge = bell && self.belled.insert(terminal_view.entity_id());
+            if !bell {
+                self.belled.remove(&terminal_view.entity_id());
+            }
+            let quiet_for = if bell {
+                quiet_for.max(NEEDS_INPUT_QUIET_THRESHOLD)
+            } else {
+                quiet_for
+            };
+
             let terminal_id = terminal_view.entity_id();
             let focused =
                 window_active && workspace_is_active && active_item_id == Some(terminal_id);
@@ -258,7 +279,9 @@ impl SessionsPanel {
             ) = (&previous_status, &new_status)
             {
                 if is_agent(command)
-                    && now.saturating_duration_since(*since) >= Self::agent_notify_threshold()
+                    && (bell_edge
+                        || now.saturating_duration_since(*since)
+                            >= Self::agent_notify_threshold())
                 {
                     if !focused {
                         cx.default_global::<SharedSessionState>()
