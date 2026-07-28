@@ -646,7 +646,10 @@ fn main() {
         });
         AppState::set_global(app_state.clone(), cx);
 
-        // hive: stripped auto_update::init(...) and auto_update_ui::init(cx)
+        // hive: auto-update re-enabled, rewired to GitHub releases
+        // (tomikng/hive) with codesign team verification before install.
+        auto_update::init(client.clone(), cx);
+        auto_update_ui::init(cx);
         dap_adapters::init(cx);
         reliability::init(client.clone(), app_state.workspace_store.clone(), cx);
         extension_host::init(

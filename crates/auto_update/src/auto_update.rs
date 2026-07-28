@@ -639,66 +639,76 @@ impl AutoUpdater {
         Ok(Some(release.url))
     }
 
+    // hive: releases come from GitHub, not Zed's cloud. `version` requests a
+    // specific tag, `None` the latest release. Only the app itself is
+    // distributed — Hive has no remote-server builds.
     async fn get_release_asset(
         this: &Entity<Self>,
-        release_channel: ReleaseChannel,
+        _release_channel: ReleaseChannel,
         version: Option<Version>,
         asset: &str,
-        os: &str,
+        _os: &str,
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
+        anyhow::ensure!(asset == "zed", "Hive does not distribute {asset} builds");
+
         let client = this.read_with(cx, |this, _| this.client.clone());
-
-        let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
-            (
-                client.telemetry().system_id(),
-                client.telemetry().metrics_id(),
-                client.telemetry().is_staff(),
-            )
-        } else {
-            (None, None, None)
-        };
-
-        let version = if let Some(mut version) = version {
-            version.pre = semver::Prerelease::EMPTY;
-            version.build = semver::BuildMetadata::EMPTY;
-            version.to_string()
-        } else {
-            "latest".to_string()
-        };
         let http_client = client.http_client();
 
-        let path = format!("/releases/{}/{}/asset", release_channel.dev_name(), version,);
-        let url = http_client.build_zed_cloud_url_with_query(
-            &path,
-            AssetQuery {
-                os,
-                arch,
-                asset,
-                metrics_id: metrics_id.as_deref(),
-                system_id: system_id.as_deref(),
-                is_staff,
-            },
-        )?;
+        let url = match version {
+            Some(version) => format!(
+                "https://api.github.com/repos/tomikng/hive/releases/tags/v{}.{}.{}",
+                version.major, version.minor, version.patch
+            ),
+            None => "https://api.github.com/repos/tomikng/hive/releases/latest".to_string(),
+        };
 
-        let mut response = http_client
-            .get(url.as_str(), Default::default(), true)
-            .await?;
+        let mut response = http_client.get(&url, Default::default(), true).await?;
         let mut body = Vec::new();
         response.body_mut().read_to_end(&mut body).await?;
-
         anyhow::ensure!(
             response.status().is_success(),
-            "failed to fetch release: {:?}",
+            "failed to fetch release from GitHub: {:?}",
             String::from_utf8_lossy(&body),
         );
 
-        serde_json::from_slice(body.as_slice()).with_context(|| {
+        #[derive(Deserialize)]
+        struct GithubRelease {
+            tag_name: String,
+            assets: Vec<GithubAsset>,
+        }
+        #[derive(Deserialize)]
+        struct GithubAsset {
+            name: String,
+            browser_download_url: String,
+        }
+
+        let release: GithubRelease = serde_json::from_slice(&body).with_context(|| {
             format!(
-                "error deserializing release {:?}",
-                String::from_utf8_lossy(&body),
+                "error deserializing GitHub release {:?}",
+                String::from_utf8_lossy(&body)
             )
+        })?;
+
+        let arch_names: &[&str] = match arch {
+            "aarch64" => &["aarch64", "arm64"],
+            other => &[other],
+        };
+        let dmg = release
+            .assets
+            .iter()
+            .find(|asset| {
+                asset.name.ends_with(".dmg")
+                    && arch_names.iter().any(|name| asset.name.contains(name))
+            })
+            .with_context(|| {
+                format!("release {} has no .dmg asset for {arch}", release.tag_name)
+            })?;
+
+        Ok(ReleaseAsset {
+            version: release.tag_name.trim_start_matches('v').to_string(),
+            url: dmg.browser_download_url.clone(),
         })
     }
 
@@ -1165,7 +1175,8 @@ async fn install_release_macos(
         .file_name()
         .with_context(|| format!("invalid running app path {running_app_path:?}"))?;
 
-    let mount_path = temp_dir.path().join("Zed");
+    // hive: the mount folder is the DMG volume name, which is "Hive".
+    let mount_path = temp_dir.path().join("Hive");
     let mut mounted_app_path: OsString = mount_path.join(running_app_filename).into();
 
     mounted_app_path.push("/");
@@ -1189,6 +1200,27 @@ async fn install_release_macos(
         mount_path: mount_path.clone(),
         background_executor,
     };
+
+    // hive: this bundle is about to replace the running app — refuse anything
+    // that isn't validly signed by our Developer ID team, so a compromised
+    // download (or GitHub account) can't ship arbitrary code via the updater.
+    let mut cmd = new_command("codesign");
+    cmd.args(["--verify", "--deep", "--strict"])
+        .arg(Path::new(&mounted_app_path));
+    let verify_output = cmd.output().await.context("failed to run codesign")?;
+    if !verify_output.status.success() {
+        let details = String::from_utf8_lossy(&verify_output.stderr).into_owned();
+        unmounter.unmount().await;
+        anyhow::bail!("downloaded update failed signature verification: {details}");
+    }
+    let mut cmd = new_command("codesign");
+    cmd.args(["-dv"]).arg(Path::new(&mounted_app_path));
+    let display_output = cmd.output().await.context("failed to run codesign -dv")?;
+    let signing_info = String::from_utf8_lossy(&display_output.stderr).into_owned();
+    if !signing_info.contains("TeamIdentifier=Q89XY3A42H") {
+        unmounter.unmount().await;
+        anyhow::bail!("downloaded update is signed by an unexpected team: {signing_info}");
+    }
 
     let mut cmd = new_command("rsync");
     cmd.args(["-av", "--delete", "--exclude", "Icon?"])

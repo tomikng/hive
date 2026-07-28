@@ -2,7 +2,9 @@
 description = "The fast, collaborative code editor."
 edition.workspace = true
 name = "zed"
-version = "1.14.0"
+# hive: our own versioning, matched to release tags (vX.Y.Z) — the
+# auto-updater compares this against the latest GitHub release tag.
+version = "0.1.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
