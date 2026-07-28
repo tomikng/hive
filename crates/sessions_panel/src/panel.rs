@@ -56,6 +56,17 @@ pub struct SessionsPanel {
     _git_subscription: Subscription,
 }
 
+/// The session's root: its first visible worktree — the project this session
+/// was opened as — regardless of where its terminals have wandered since.
+fn session_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
+    workspace
+        .project()
+        .read(cx)
+        .visible_worktrees(cx)
+        .next()
+        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+}
+
 /// Walks up from `path` to the enclosing git repository root. `.git` may be
 /// a directory or, for linked worktrees, a file — `exists()` covers both.
 fn repo_root_for(path: &Path) -> Option<PathBuf> {
@@ -70,7 +81,10 @@ pub fn init(cx: &mut App) {
             workspace.toggle_panel_focus::<SessionsPanel>(window, cx);
         });
         workspace.register_action(|workspace, _: &NewSession, window, cx| {
-            let cwd = terminal_view::default_working_directory(workspace, cx);
+            // New terminals open at the session's root, not wherever the
+            // focused terminal happens to be.
+            let cwd = session_root(workspace, cx)
+                .or_else(|| terminal_view::default_working_directory(workspace, cx));
             TerminalPanel::add_center_terminal(workspace, window, cx, move |project, cx| {
                 project.create_terminal_shell(cwd, cx)
             })
@@ -538,43 +552,72 @@ impl SessionsPanel {
             .collect()
     }
 
+    /// The innermost repository whose work directory contains `path`, from
+    /// the workspace's project.
+    fn repository_containing(
+        workspace: &Workspace,
+        path: &Path,
+        cx: &App,
+    ) -> Option<Entity<project::git_store::Repository>> {
+        let git_store = workspace.project().read(cx).git_store().read(cx);
+        git_store
+            .repositories()
+            .values()
+            .filter(|repository| {
+                path.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
+            })
+            .max_by_key(|repository| {
+                repository.read(cx).work_directory_abs_path.as_os_str().len()
+            })
+            .cloned()
+    }
+
     /// Uncommitted-changes summary `(changed_files, added_lines, deleted_lines)`
-    /// summed over every repository in the workspace's project (a session may
-    /// hold several auto-attached repos), or `None` when everything is clean.
+    /// for one repository, or `None` when it's clean.
     ///
     /// Sums `StatusEntry::diff_stat` (head-to-worktree, i.e. staged and
     /// unstaged combined) rather than the staged/unstaged split, since the
-    /// rail shows one total per session.
-    fn workspace_diff_stat(
-        workspace: &Entity<Workspace>,
+    /// rail shows one total.
+    fn repository_diff_stat(
+        repository: &Entity<project::git_store::Repository>,
         cx: &App,
     ) -> Option<(usize, u32, u32)> {
-        let project = workspace.read(cx).project().read(cx);
-        let git_store = project.git_store().read(cx);
-        let mut files = 0usize;
-        let mut added = 0u32;
-        let mut deleted = 0u32;
-        for repository in git_store.repositories().values() {
-            let repository = repository.read(cx);
-            files += repository.status_summary().count;
-            for entry in repository.status() {
-                if let Some(diff_stat) = entry.diff_stat {
-                    added += diff_stat.added;
-                    deleted += diff_stat.deleted;
-                }
-            }
+        let repository = repository.read(cx);
+        let summary = repository.status_summary();
+        if summary.count == 0 {
+            return None;
         }
-        (files > 0).then_some((files, added, deleted))
+        let (added, deleted) = repository
+            .status()
+            .filter_map(|entry| entry.diff_stat)
+            .fold((0u32, 0u32), |(added, deleted), diff_stat| {
+                (added + diff_stat.added, deleted + diff_stat.deleted)
+            });
+        Some((summary.count, added, deleted))
     }
 
     fn render_session(
         &self,
         terminal_view: Entity<TerminalView>,
         workspace: Entity<Workspace>,
+        session_root_repo: Option<&Path>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let terminal_id = terminal_view.entity_id();
         let title = terminal_view.read(cx).terminal().read(cx).title(true);
+        // A terminal sitting in a different repo than the session root shows
+        // that repo's diff on its own row — "where this terminal is now".
+        let foreign_repo_stat = terminal_view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .working_directory()
+            .and_then(|cwd| Self::repository_containing(workspace.read(cx), &cwd, cx))
+            .filter(|repository| {
+                session_root_repo
+                    != Some(repository.read(cx).work_directory_abs_path.as_ref())
+            })
+            .and_then(|repository| Self::repository_diff_stat(&repository, cx));
         let (status, unseen) = cx
             .try_global::<SharedSessionState>()
             .map(|shared| {
@@ -616,7 +659,18 @@ impl SessionsPanel {
         let close_terminal_view = terminal_view.clone();
         ListItem::new(("session", terminal_view.entity_id()))
             .start_slot(indicator)
-            .child(Label::new(title).single_line())
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(Label::new(title).single_line())
+                    .when_some(foreign_repo_stat, |this, (files, added, deleted)| {
+                        this.child(
+                            Label::new(format!("±{files} +{added} −{deleted}"))
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                    }),
+            )
             .end_slot_on_hover(
                 IconButton::new(
                     ("close-session", terminal_view.entity_id()),
@@ -765,9 +819,11 @@ impl Render for SessionsPanel {
                                         return;
                                     };
                                     workspace.update(cx, |workspace, cx| {
-                                        let cwd = terminal_view::default_working_directory(
-                                            workspace, cx,
-                                        );
+                                        let cwd = session_root(workspace, cx).or_else(|| {
+                                            terminal_view::default_working_directory(
+                                                workspace, cx,
+                                            )
+                                        });
                                         TerminalPanel::add_center_terminal(
                                             workspace,
                                             window,
@@ -810,12 +866,25 @@ impl Render for SessionsPanel {
 
         for (name, workspace, terminals) in self.session_groups(cx) {
             let is_active = active_workspace.as_ref() == Some(&workspace);
+            // The header stat is anchored to the session's ROOT repo. Repos
+            // that terminals wandered into via auto-attach are shown on the
+            // terminal rows instead, not summed here.
+            let root_repository = session_root(workspace.read(cx), cx)
+                .and_then(|root| Self::repository_containing(workspace.read(cx), &root, cx));
+            let root_repo_path = root_repository
+                .as_ref()
+                .map(|repository| {
+                    repository.read(cx).work_directory_abs_path.to_path_buf()
+                });
             let mut header = h_flex().gap_2().child(
                 Label::new(name)
                     .size(LabelSize::Small)
                     .color(if is_active { Color::Default } else { Color::Muted }),
             );
-            if let Some((files, added, deleted)) = Self::workspace_diff_stat(&workspace, cx) {
+            if let Some((files, added, deleted)) = root_repository
+                .as_ref()
+                .and_then(|repository| Self::repository_diff_stat(repository, cx))
+            {
                 header = header.child(
                     Label::new(format!("±{files} · +{added} −{deleted}"))
                         .size(LabelSize::Small)
@@ -831,7 +900,12 @@ impl Render for SessionsPanel {
                     })),
             );
             for terminal_view in terminals {
-                root = root.child(self.render_session(terminal_view, workspace.clone(), cx));
+                root = root.child(self.render_session(
+                    terminal_view,
+                    workspace.clone(),
+                    root_repo_path.as_deref(),
+                    cx,
+                ));
             }
         }
         root
