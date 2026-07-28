@@ -6,8 +6,7 @@ use gpui::{
     MouseButton, ParentElement, StatefulInteractiveElement, Styled, WeakEntity, Window,
     WindowButtonLayout, WindowControlArea, div, px,
 };
-use project::DisableAiSettings;
-use settings::Settings;
+
 use smallvec::SmallVec;
 use std::mem;
 use ui::{
@@ -109,8 +108,10 @@ impl PlatformTitleBar {
             .unwrap_or_default()
     }
 
-    pub fn is_multi_workspace_enabled(cx: &App) -> bool {
-        !DisableAiSettings::get_global(cx).disable_ai
+    pub fn is_multi_workspace_enabled(_cx: &App) -> bool {
+        // hive: always on — sessions map to workspaces, and upstream's
+        // coupling to the AI sidebar doesn't apply (Hive ships disable_ai).
+        true
     }
 }
 

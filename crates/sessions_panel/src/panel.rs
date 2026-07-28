@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -9,7 +9,7 @@ use gpui::{
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{Indicator, ListItem, Tooltip, prelude::*};
+use ui::{CommonAnimationExt as _, Indicator, ListItem, Tooltip, prelude::*};
 use workspace::{
     Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -19,6 +19,18 @@ use workspace::{
 use crate::status::{SessionStatus, StatusTracker, is_agent};
 
 actions!(sessions_panel, [ToggleFocus, NewSession]);
+
+/// Session status and unseen-activity flags shared across every workspace's
+/// panel in the window. Each panel polls only its own workspace's terminals,
+/// but the rail renders all workspaces' sessions — this global is how one
+/// panel sees the others' state.
+#[derive(Default)]
+struct SharedSessionState {
+    statuses: HashMap<EntityId, SessionStatus>,
+    unseen: HashSet<EntityId>,
+}
+
+impl gpui::Global for SharedSessionState {}
 
 pub struct SessionsPanel {
     workspace: WeakEntity<Workspace>,
@@ -149,10 +161,31 @@ impl SessionsPanel {
         let now = Instant::now();
         let threshold = Self::notify_threshold();
 
-        self.trackers
-            .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
-        self.activity
-            .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
+        // Whether this panel's workspace is the window's active one — a
+        // terminal only counts as "focused" (activity seen) when its
+        // workspace is showing, it is the active item, and the window is
+        // active.
+        let workspace_is_active = workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+            .map(|multi_workspace| multi_workspace.read(cx).workspace() == &workspace)
+            .unwrap_or(true);
+        let active_item_id = workspace.read(cx).active_item(cx).map(|item| item.item_id());
+
+        let live_ids: HashSet<EntityId> =
+            terminals.iter().map(|terminal| terminal.entity_id()).collect();
+        {
+            let shared = cx.default_global::<SharedSessionState>();
+            for id in self.trackers.keys() {
+                if !live_ids.contains(id) {
+                    shared.statuses.remove(id);
+                    shared.unseen.remove(id);
+                }
+            }
+        }
+        self.trackers.retain(|id, _| live_ids.contains(id));
+        self.activity.retain(|id, _| live_ids.contains(id));
 
         let cwds: Vec<PathBuf> = terminals
             .iter()
@@ -175,11 +208,76 @@ impl SessionsPanel {
             let quiet_for = now.saturating_duration_since(last_activity.1);
             let agent = foreground.as_deref().is_some_and(is_agent);
 
+            let terminal_id = terminal_view.entity_id();
+            let focused =
+                window_active && workspace_is_active && active_item_id == Some(terminal_id);
+            let previous_status = cx
+                .default_global::<SharedSessionState>()
+                .statuses
+                .get(&terminal_id)
+                .cloned();
+
             let tracker = self
                 .trackers
-                .entry(terminal_view.entity_id())
+                .entry(terminal_id)
                 .or_insert_with(StatusTracker::new);
-            if let Some(finished) = tracker.update(foreground.as_deref(), quiet_for, agent, now) {
+            let finished_command = tracker.update(foreground.as_deref(), quiet_for, agent, now);
+            let new_status = tracker.status().clone();
+
+            // Warp-style attention: a long-running agent that just went quiet
+            // is done or waiting on the user. Mark the session unseen and
+            // notify — agents like claude never *exit*, so the
+            // command-finished path below can't cover them.
+            if let (
+                Some(SessionStatus::Running { command, since }),
+                SessionStatus::NeedsInput { .. },
+            ) = (&previous_status, &new_status)
+            {
+                if is_agent(command) && now.saturating_duration_since(*since) >= threshold {
+                    if !focused {
+                        cx.default_global::<SharedSessionState>()
+                            .unseen
+                            .insert(terminal_id);
+                    }
+                    let title = terminal_view.read(cx).terminal().read(cx).title(true);
+                    if !window_active {
+                        cx.show_system_notification(SystemNotification {
+                            tag: format!("hive-session-{terminal_id}").into(),
+                            title: format!("{command} is waiting for you").into(),
+                            body: title.into(),
+                            actions: Vec::new(),
+                        });
+                    } else if !focused && let Some(workspace) = self.workspace.upgrade() {
+                        let id = NotificationId::composite::<Self>((
+                            "session-needs-input",
+                            terminal_id,
+                        ));
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_toast(
+                                Toast::new(id, format!("{command} is waiting for you"))
+                                    .autohide(),
+                                cx,
+                            );
+                        });
+                    }
+                }
+            }
+
+            if focused {
+                cx.default_global::<SharedSessionState>()
+                    .unseen
+                    .remove(&terminal_id);
+            }
+            cx.default_global::<SharedSessionState>()
+                .statuses
+                .insert(terminal_id, new_status);
+
+            if let Some(finished) = finished_command {
+                if !focused {
+                    cx.default_global::<SharedSessionState>()
+                        .unseen
+                        .insert(terminal_id);
+                }
                 if finished.duration >= threshold {
                     let mins = finished.duration.as_secs() / 60;
                     let secs = finished.duration.as_secs() % 60;
@@ -334,106 +432,136 @@ impl SessionsPanel {
         }
     }
 
-    /// All terminal items in the window's center panes, grouped by
-    /// worktree root (project) path.
-    fn sessions(&self, cx: &App) -> Vec<(String, Vec<Entity<TerminalView>>)> {
-        let Some(workspace) = self.workspace.upgrade() else {
+    /// One rail group per workspace in the window (a session = a workspace
+    /// with its own tabs). Falls back to just this panel's workspace when the
+    /// window has no MultiWorkspace.
+    fn session_groups(
+        &self,
+        cx: &App,
+    ) -> Vec<(String, Entity<Workspace>, Vec<Entity<TerminalView>>)> {
+        let Some(own_workspace) = self.workspace.upgrade() else {
             return Vec::new();
         };
-        let workspace = workspace.read(cx);
-        let project = workspace.project().read(cx);
+        let workspaces: Vec<Entity<Workspace>> = own_workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+            .map(|multi_workspace| multi_workspace.read(cx).workspaces().cloned().collect())
+            .unwrap_or_else(|| vec![own_workspace.clone()]);
 
-        let mut groups: Vec<(String, Vec<Entity<TerminalView>>)> = project
-            .visible_worktrees(cx)
-            .map(|worktree| {
-                let worktree = worktree.read(cx);
-                (worktree.abs_path().to_string_lossy().into_owned(), Vec::new())
+        workspaces
+            .into_iter()
+            .map(|workspace| {
+                let terminals: Vec<Entity<TerminalView>> = workspace
+                    .read(cx)
+                    .items_of_type::<TerminalView>(cx)
+                    .collect();
+                let label = workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| {
+                        let path = worktree.read(cx).abs_path();
+                        path.file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+                    })
+                    .or_else(|| {
+                        terminals.first().and_then(|terminal_view| {
+                            terminal_view
+                                .read(cx)
+                                .terminal()
+                                .read(cx)
+                                .working_directory()
+                                .and_then(|cwd| {
+                                    cwd.file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                })
+                        })
+                    })
+                    .unwrap_or_else(|| "session".into());
+                (label, workspace, terminals)
             })
-            .collect();
-
-        for terminal_view in workspace.items_of_type::<TerminalView>(cx) {
-            let cwd = terminal_view
-                .read(cx)
-                .terminal()
-                .read(cx)
-                .working_directory();
-            // ponytail: position + index instead of iter_mut().find() to sidestep
-            // the borrow held across the None arm's groups.push().
-            let index = cwd.as_deref().and_then(|cwd| {
-                groups
-                    .iter()
-                    .position(|(root, _)| cwd.starts_with(root.as_str()))
-            });
-            match index {
-                Some(index) => groups[index].1.push(terminal_view),
-                None => {
-                    let label = cwd
-                        .map(|cwd| cwd.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "terminal".into());
-                    groups.push((label, vec![terminal_view]));
-                }
-            }
-        }
-        groups
+            .collect()
     }
 
     /// Uncommitted-changes summary `(changed_files, added_lines, deleted_lines)`
-    /// for the repository whose work directory contains `worktree_abs_path`,
-    /// or `None` when there are no uncommitted changes.
+    /// summed over every repository in the workspace's project (a session may
+    /// hold several auto-attached repos), or `None` when everything is clean.
     ///
     /// Sums `StatusEntry::diff_stat` (head-to-worktree, i.e. staged and
-    /// unstaged combined) rather than `staged_diff_stat`/`unstaged_diff_stat`,
-    /// since the sidebar shows one total per project rather than a
-    /// staged/unstaged split.
-    fn project_diff_stat(&self, worktree_abs_path: &Path, cx: &App) -> Option<(usize, u32, u32)> {
-        let workspace = self.workspace.upgrade()?;
+    /// unstaged combined) rather than the staged/unstaged split, since the
+    /// rail shows one total per session.
+    fn workspace_diff_stat(
+        workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> Option<(usize, u32, u32)> {
         let project = workspace.read(cx).project().read(cx);
         let git_store = project.git_store().read(cx);
-        // Match the innermost repository whose work directory contains the
-        // worktree root, mirroring GitStore::set_active_repo_for_worktree.
-        let repository = git_store
-            .repositories()
-            .values()
-            .filter(|repository| {
-                worktree_abs_path.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
-            })
-            .max_by_key(|repository| repository.read(cx).work_directory_abs_path.as_os_str().len())?
-            .read(cx);
-
-        let summary = repository.status_summary();
-        if summary.count == 0 {
-            return None;
+        let mut files = 0usize;
+        let mut added = 0u32;
+        let mut deleted = 0u32;
+        for repository in git_store.repositories().values() {
+            let repository = repository.read(cx);
+            files += repository.status_summary().count;
+            for entry in repository.status() {
+                if let Some(diff_stat) = entry.diff_stat {
+                    added += diff_stat.added;
+                    deleted += diff_stat.deleted;
+                }
+            }
         }
-
-        let (added, deleted) = repository
-            .status()
-            .filter_map(|entry| entry.diff_stat)
-            .fold((0u32, 0u32), |(added, deleted), diff_stat| {
-                (added + diff_stat.added, deleted + diff_stat.deleted)
-            });
-        Some((summary.count, added, deleted))
+        (files > 0).then_some((files, added, deleted))
     }
 
     fn render_session(
         &self,
         terminal_view: Entity<TerminalView>,
+        workspace: Entity<Workspace>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
+        let terminal_id = terminal_view.entity_id();
         let title = terminal_view.read(cx).terminal().read(cx).title(true);
-        let status = self
-            .trackers
-            .get(&terminal_view.entity_id())
-            .map(|tracker| tracker.status().clone())
-            .unwrap_or(SessionStatus::Idle);
-        let indicator = match status {
-            SessionStatus::Running { .. } => Indicator::dot().color(Color::Modified),
+        let (status, unseen) = cx
+            .try_global::<SharedSessionState>()
+            .map(|shared| {
+                (
+                    shared
+                        .statuses
+                        .get(&terminal_id)
+                        .cloned()
+                        .unwrap_or(SessionStatus::Idle),
+                    shared.unseen.contains(&terminal_id),
+                )
+            })
+            .unwrap_or((SessionStatus::Idle, false));
+        let indicator = match &status {
+            // A running agent gets a spinner; plain commands keep the dot.
+            SessionStatus::Running { command, .. } if is_agent(command) => {
+                Icon::new(IconName::ArrowCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Accent)
+                    .with_keyed_rotate_animation(("session-spinner", terminal_id), 2)
+                    .into_any_element()
+            }
+            SessionStatus::Running { .. } => {
+                Indicator::dot().color(Color::Modified).into_any_element()
+            }
             // Heuristic-only status (see status.rs) -- distinct amber color so
             // it doesn't read as the same "actively running" state.
-            SessionStatus::NeedsInput { .. } => Indicator::dot().color(Color::Warning),
-            SessionStatus::Idle => Indicator::dot().color(Color::Hidden),
+            SessionStatus::NeedsInput { .. } => {
+                Indicator::dot().color(Color::Warning).into_any_element()
+            }
+            // Warp-style: quiet session with activity you haven't looked at.
+            SessionStatus::Idle if unseen => {
+                Indicator::dot().color(Color::Accent).into_any_element()
+            }
+            SessionStatus::Idle => Indicator::dot().color(Color::Hidden).into_any_element(),
         };
-        let workspace = self.workspace.clone();
-        let close_workspace = self.workspace.clone();
+        let activate_workspace = workspace.clone();
+        let close_workspace = workspace;
         let close_terminal_view = terminal_view.clone();
         ListItem::new(("session", terminal_view.entity_id()))
             .start_slot(indicator)
@@ -448,10 +576,7 @@ impl SessionsPanel {
                 .tooltip(Tooltip::text("Close Session"))
                 .on_click(cx.listener(move |_this, _event, window, cx| {
                     cx.stop_propagation();
-                    let Some(workspace) = close_workspace.upgrade() else {
-                        return;
-                    };
-                    workspace.update(cx, |workspace, cx| {
+                    close_workspace.update(cx, |workspace, cx| {
                         if let Some(pane) = workspace.pane_for(&close_terminal_view) {
                             pane.update(cx, |pane, cx| {
                                 pane.close_item_by_id(
@@ -467,39 +592,70 @@ impl SessionsPanel {
                 })),
             )
             .on_click(cx.listener(move |_this, _event, window, cx| {
-                if let Some(workspace) = workspace.upgrade() {
-                    workspace.update(cx, |workspace, cx| {
-                        workspace.activate_item(&terminal_view, true, true, window, cx);
-                    });
-                }
+                cx.default_global::<SharedSessionState>()
+                    .unseen
+                    .remove(&terminal_view.entity_id());
+                Self::activate_workspace(&activate_workspace, window, cx);
+                activate_workspace.update(cx, |workspace, cx| {
+                    workspace.activate_item(&terminal_view, true, true, window, cx);
+                });
             }))
+    }
+
+    /// Makes `workspace` the window's active workspace (swapping the whole
+    /// tab strip to that session), if it isn't already.
+    fn activate_workspace(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
+        let Some(multi_workspace) = workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+        else {
+            return;
+        };
+        if multi_workspace.read(cx).workspace() != workspace {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace.activate(workspace.clone(), None, window, cx);
+            });
+        }
     }
 }
 
 impl Render for SessionsPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_workspace = self.workspace.upgrade().and_then(|workspace| {
+            workspace
+                .read(cx)
+                .multi_workspace()
+                .and_then(|multi_workspace| multi_workspace.upgrade())
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+                .or(Some(workspace))
+        });
+
         let mut root = v_flex().size_full().p_1();
-        for (project_root, terminals) in self.sessions(cx) {
-            let project_root_path = Path::new(&project_root);
-            let name = project_root_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_else(|| project_root.clone());
-            let mut header = h_flex()
-                .gap_2()
-                .child(Label::new(name).size(LabelSize::Small).color(Color::Muted));
-            if let Some((files, added, deleted)) =
-                self.project_diff_stat(project_root_path, cx)
-            {
+        for (name, workspace, terminals) in self.session_groups(cx) {
+            let is_active = active_workspace.as_ref() == Some(&workspace);
+            let mut header = h_flex().gap_2().child(
+                Label::new(name)
+                    .size(LabelSize::Small)
+                    .color(if is_active { Color::Default } else { Color::Muted }),
+            );
+            if let Some((files, added, deleted)) = Self::workspace_diff_stat(&workspace, cx) {
                 header = header.child(
                     Label::new(format!("±{files} · +{added} −{deleted}"))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 );
             }
-            root = root.child(header);
+            let header_workspace = workspace.clone();
+            root = root.child(
+                ListItem::new(("session-group", workspace.entity_id()))
+                    .child(header)
+                    .on_click(cx.listener(move |_this, _event, window, cx| {
+                        Self::activate_workspace(&header_workspace, window, cx);
+                    })),
+            );
             for terminal_view in terminals {
-                root = root.child(self.render_session(terminal_view, cx));
+                root = root.child(self.render_session(terminal_view, workspace.clone(), cx));
             }
         }
         root
