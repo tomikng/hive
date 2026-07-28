@@ -61,6 +61,7 @@ use paths::{
     local_tasks_file_relative_path,
 };
 use project::{DirectoryLister, DisableAiSettings, ProjectItem};
+#[cfg(test)]
 use project_panel::ProjectPanel;
 use sessions_panel::{FileTreePanel, SessionsPanel};
 use quick_action_bar::QuickActionBar;
@@ -773,7 +774,8 @@ fn show_software_emulation_warning_if_needed(
 
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
-        let project_panel = ProjectPanel::load(workspace_handle.clone(), cx.clone());
+        // hive: no ProjectPanel — the auto-rooting FileTreePanel (right dock)
+        // is the one file browser; two trees confused more than they helped.
         let sessions_panel = SessionsPanel::load(workspace_handle.clone(), cx.clone());
         let file_tree_panel = FileTreePanel::load(workspace_handle.clone(), cx.clone());
         let outline_panel = OutlinePanel::load(workspace_handle.clone(), cx.clone());
@@ -798,7 +800,6 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
         }
 
         futures::join!(
-            add_panel_when_ready(project_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(sessions_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(file_tree_panel, workspace_handle.clone(), cx.clone()),
             add_panel_when_ready(outline_panel, workspace_handle.clone(), cx.clone()),
@@ -1261,7 +1262,9 @@ fn register_actions(
              _: &zed_actions::project_panel::ToggleFocus,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
-                workspace.toggle_panel_focus::<ProjectPanel>(window, cx);
+                // hive: ProjectPanel is gone; its shortcut drives the
+                // auto-rooting file tree so muscle memory keeps working.
+                workspace.toggle_panel_focus::<FileTreePanel>(window, cx);
             },
         )
         .register_action(
