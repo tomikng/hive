@@ -1274,11 +1274,18 @@ fn reveal_terminal_cwd(
                                 window,
                                 cx,
                             );
-                            cx.spawn(async move |_, _cx| {
+                            cx.spawn_in(window, async move |workspace, cx| {
                                 for result in open.await.into_iter().flatten() {
                                     result.log_err();
                                 }
-                                anyhow::Ok(())
+                                // A folder added to an existing window skips the
+                                // window-open trust check, leaving the worktree
+                                // restricted (git and tasks disabled) with no
+                                // visible cue. Surface the standard prompt.
+                                workspace.update_in(cx, |workspace, window, cx| {
+                                    workspace
+                                        .show_worktree_trust_security_modal(false, window, cx);
+                                })
                             })
                             .detach_and_log_err(cx);
                         })

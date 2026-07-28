@@ -16786,6 +16786,7 @@ dependencies = [
  "anyhow",
  "db",
  "gpui",
+ "log",
  "project",
  "settings",
  "terminal",

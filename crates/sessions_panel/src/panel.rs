@@ -268,9 +268,22 @@ impl SessionsPanel {
             }
             log::info!("sessions_panel: auto-attaching repo {}", root.display());
             self.auto_attached_repos.insert(root.clone(), now);
-            project
-                .update(cx, |project, cx| project.create_worktree(&root, true, cx))
-                .detach_and_log_err(cx);
+            let create = project
+                .update(cx, |project, cx| project.create_worktree(&root, true, cx));
+            let workspace = self.workspace.clone();
+            let window_handle = self.window_handle;
+            cx.spawn(async move |_, cx| {
+                create.await?;
+                // Freshly attached worktrees start restricted (git and tasks
+                // disabled) — surface the standard trust prompt, once per
+                // repo; trusting persists.
+                window_handle.update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.show_worktree_trust_security_modal(false, window, cx);
+                    })
+                })?
+            })
+            .detach_and_log_err(cx);
         }
 
         let detach_after = Self::auto_detach_after();
