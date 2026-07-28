@@ -86,7 +86,7 @@ pub enum SandboxNetworkAccess {
 pub enum LinuxWslSandboxError {
     /// No usable `bwrap` binary was found on `PATH`.
     BwrapNotFound,
-    /// The only `bwrap` found is setuid-root, which Zed refuses to run.
+    /// The only `bwrap` found is setuid-root, which Hive refuses to run.
     SetuidRejected,
     /// `bwrap` is present but couldn't set up the sandbox (typically because
     /// unprivileged user namespaces are disabled).
@@ -117,7 +117,7 @@ impl LinuxWslSandboxError {
                     .to_string()
             }
             LinuxWslSandboxError::SetuidRejected => {
-                "The only `bwrap` available is setuid-root, which Zed refuses to run. Install \
+                "The only `bwrap` available is setuid-root, which Hive refuses to run. Install \
                  a non-setuid Bubblewrap to let the agent sandbox terminal commands."
                     .to_string()
             }

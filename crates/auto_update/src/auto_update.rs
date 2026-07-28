@@ -308,7 +308,7 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
     {
         drop(window.prompt(
             gpui::PromptLevel::Info,
-            "Zed was installed via a package manager.",
+            "Hive was installed via a package manager.",
             Some(&message),
             &["OK"],
             cx,
@@ -389,7 +389,7 @@ impl InstallerDir {
     async fn new() -> Result<Self> {
         let installer_dir = std::env::current_exe()?
             .parent()
-            .context("No parent dir for Zed.exe")?
+            .context("No parent dir for Hive.exe")?
             .join("updates");
         if smol::fs::metadata(&installer_dir).await.is_ok() {
             smol::fs::remove_dir_all(&installer_dir).await?;
@@ -424,7 +424,7 @@ impl AutoUpdater {
         // On windows, executable files cannot be overwritten while they are
         // running, so we must wait to overwrite the application until quitting
         // or restarting. When quitting the app, we spawn the auto update helper
-        // to finish the auto update process after Zed exits. When restarting
+        // to finish the auto update process after Hive exits. When restarting
         // the app after an update, we use `set_restart_path` to run the auto
         // update helper instead of the app, so that it can overwrite the app
         // and then spawn the new binary.
@@ -555,7 +555,7 @@ impl AutoUpdater {
         true
     }
 
-    // If you are packaging Zed and need to override the place it downloads SSH remotes from,
+    // If you are packaging Hive and need to override the place it downloads SSH remotes from,
     // you can override this function. You should also update get_remote_server_release_url to return
     // Ok(None).
     pub async fn download_remote_server_release(
@@ -636,7 +636,7 @@ impl AutoUpdater {
         Ok(Some(release.url))
     }
 
-    // hive: releases come from GitHub, not Zed's cloud. `version` requests a
+    // hive: releases come from GitHub, not Hive's cloud. `version` requests a
     // specific tag, `None` the latest release. Only the app itself is
     // distributed — Hive has no remote-server builds.
     async fn get_release_asset(
@@ -890,9 +890,9 @@ impl AutoUpdater {
 
     async fn target_path(installer_dir: &InstallerDir) -> Result<PathBuf> {
         let filename = match OS {
-            "macos" => anyhow::Ok("Zed.dmg"),
+            "macos" => anyhow::Ok("Hive.dmg"),
             "linux" => Ok("zed.tar.gz"),
-            "windows" => Ok("Zed.exe"),
+            "windows" => Ok("Hive.exe"),
             unsupported_os => anyhow::bail!("not supported: {unsupported_os}"),
         }?;
 
@@ -1153,7 +1153,7 @@ async fn install_release_linux(
 
     anyhow::ensure!(
         output.status.success(),
-        "failed to copy Zed update from {:?} to {:?}: {:?}",
+        "failed to copy Hive update from {:?} to {:?}: {:?}",
         from,
         to,
         String::from_utf8_lossy(&output.stderr)
@@ -1236,7 +1236,7 @@ async fn install_release_macos(
     Ok(None)
 }
 
-/// Removes stale installer dirs from the system temp dir. Older Zed versions
+/// Removes stale installer dirs from the system temp dir. Older Hive versions
 /// leaked one per update by deleting the dir while the downloaded disk image
 /// was still mounted inside it, which made the deletion fail silently.
 #[cfg(any(rust_analyzer, all(not(target_os = "windows"), not(test))))]
@@ -1260,7 +1260,7 @@ async fn cleanup_stale_installer_dirs() {
             continue;
         }
         // Leave recent dirs alone, as they may belong to an update currently
-        // in progress in another Zed instance.
+        // in progress in another Hive instance.
         let is_stale = entry.metadata().await.ok().is_some_and(|metadata| {
             metadata.is_dir()
                 && metadata.modified().ok().is_some_and(|modified| {
@@ -1285,7 +1285,7 @@ async fn cleanup_stale_installer_dirs() {
 async fn cleanup_windows() -> Result<()> {
     let parent = std::env::current_exe()?
         .parent()
-        .context("No parent dir for Zed.exe")?
+        .context("No parent dir for Hive.exe")?
         .to_owned();
 
     // keep in sync with crates/auto_update_helper/src/updater.rs
@@ -1312,7 +1312,7 @@ async fn install_release_windows(downloaded_installer: &Path) -> Result<Option<P
     // deleting the old one, and launching the new binary.
     let helper_path = std::env::current_exe()?
         .parent()
-        .context("No parent dir for Zed.exe")?
+        .context("No parent dir for Hive.exe")?
         .join("tools")
         .join("auto_update_helper.exe");
     Ok(Some(helper_path))
