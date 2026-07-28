@@ -63,8 +63,21 @@ pub struct SessionsPanel {
     /// immediately — spinner, dot and notification all flip at ring time
     /// instead of up to one poll interval later.
     bell_subscriptions: HashMap<EntityId, Subscription>,
+    /// When the window last gained or lost focus. TUI agents ask for focus
+    /// reporting and repaint on the `\x1b[I` / `\x1b[O` the terminal sends
+    /// them, so the visible content changes with no agent activity behind
+    /// it. Counting that repaint restarted the quiet timer: focusing the
+    /// window flipped a waiting session back to a spinner, and leaving it
+    /// re-fired the needs-input notification seconds later.
+    focus_changed_at: Option<Instant>,
     _git_subscription: Subscription,
+    _window_activation_subscription: Subscription,
 }
+
+/// How long after a focus change content changes count as repaint noise
+/// rather than agent output. Must exceed the 2s poll interval so the poll
+/// that first sees the repaint still absorbs it.
+const FOCUS_REPAINT_GRACE: Duration = Duration::from_secs(3);
 
 /// The session's root: its first visible worktree — the project this session
 /// was opened as — regardless of where its terminals have wandered since.
@@ -144,6 +157,10 @@ impl SessionsPanel {
                         _ => {}
                     },
                 );
+                let window_activation_subscription =
+                    cx.observe_window_activation(window, |this, _window, _cx| {
+                        this.focus_changed_at = Some(Instant::now());
+                    });
                 SessionsPanel {
                     workspace: weak,
                     focus_handle: cx.focus_handle(),
@@ -155,7 +172,9 @@ impl SessionsPanel {
                     naming_attempted: HashSet::default(),
                     belled: HashSet::default(),
                     bell_subscriptions: HashMap::default(),
+                    focus_changed_at: None,
                     _git_subscription: git_subscription,
+                    _window_activation_subscription: window_activation_subscription,
                 }
             })
         })
@@ -247,12 +266,21 @@ impl SessionsPanel {
                 hasher.finish()
             };
 
+            let focus_repaint = self
+                .focus_changed_at
+                .is_some_and(|at| now.saturating_duration_since(at) < FOCUS_REPAINT_GRACE);
             let last_activity = self
                 .activity
                 .entry(terminal_view.entity_id())
                 .or_insert((content_digest, now));
             if last_activity.0 != content_digest {
-                *last_activity = (content_digest, now);
+                // Take the new digest either way, so a repaint isn't
+                // re-detected as activity once the grace window closes; only
+                // restart the quiet timer when it wasn't focus-driven.
+                last_activity.0 = content_digest;
+                if !focus_repaint {
+                    last_activity.1 = now;
+                }
             }
             let quiet_for = now.saturating_duration_since(last_activity.1);
             let agent = foreground.as_deref().is_some_and(is_agent);

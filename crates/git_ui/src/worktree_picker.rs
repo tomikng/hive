@@ -788,9 +788,11 @@ impl PickerDelegate for WorktreePickerDelegate {
         let has_named_worktree = self.all_worktrees.iter().any(|worktree| {
             worktree.directory_name(main_worktree_path.as_deref()) == normalized_query
         });
-        let create_named_disabled_reason: Option<String> = if self.has_multiple_repositories {
-            Some("Cannot create a named worktree in a project with multiple repositories".into())
-        } else if has_named_worktree {
+        // A name is no different in kind from the generated one the unnamed
+        // "based on current branches" entry uses, and that entry is offered
+        // with multiple repositories: creation makes one worktree of that
+        // name per repo, each under its own worktree directory.
+        let create_named_disabled_reason: Option<String> = if has_named_worktree {
             Some("A worktree with this name already exists".into())
         } else {
             None
