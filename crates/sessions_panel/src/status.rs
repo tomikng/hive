@@ -11,7 +11,10 @@ const AGENTS: &[&str] = &["claude", "aider", "codex", "cursor-agent"];
 
 /// How long an agent must produce no terminal output before we guess it's
 /// sitting at a prompt waiting on the user.
-pub const NEEDS_INPUT_QUIET_THRESHOLD: Duration = Duration::from_secs(10);
+// Was 10s when "quiet" was inferred from the cursor position, which TUI
+// agents perturb constantly — the panel now hashes visible content, a much
+// stronger signal, so the threshold can be tight without false positives.
+pub const NEEDS_INPUT_QUIET_THRESHOLD: Duration = Duration::from_secs(4);
 
 pub fn is_agent(name: &str) -> bool {
     let base = name.rsplit('/').next().unwrap_or(name).trim_start_matches('-');

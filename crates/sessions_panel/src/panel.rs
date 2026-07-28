@@ -37,15 +37,12 @@ pub struct SessionsPanel {
     focus_handle: FocusHandle,
     window_handle: AnyWindowHandle,
     pub(crate) trackers: HashMap<EntityId, StatusTracker>,
-    /// Per-terminal (last seen cursor position, when it last moved). The
-    /// cursor moves whenever the terminal renders new output, so "cursor
-    /// unchanged since `Instant`" is used as a cheap proxy for "no output
-    /// since `Instant`" -- there's no dedicated last-output timestamp or byte
-    /// counter on `Terminal` to read instead. This can under-count quiet time
-    /// for output that redraws in place without moving the cursor (e.g. some
-    /// spinners), which is one more reason `NeedsInput` is a heuristic, not a
-    /// fact.
-    activity: HashMap<EntityId, (terminal::Point, Instant)>,
+    /// Per-terminal (digest of visible content, when it last changed).
+    /// "Content stopped changing" is the quiet signal. The cursor position
+    /// was used before, but TUI agents (claude) move the cursor constantly
+    /// even while idle — status bar, spinner rows — so quiet never
+    /// registered and needs-input fired late or not at all.
+    activity: HashMap<EntityId, (u64, Instant)>,
     /// Repos this panel attached to the workspace because a terminal cd'd
     /// into them, and when a terminal was last seen inside each. Only these
     /// are ever auto-removed — folders the user opened are never touched.
@@ -202,12 +199,19 @@ impl SessionsPanel {
         for terminal_view in terminals {
             let terminal = terminal_view.read(cx).terminal().read(cx);
             let foreground = terminal.foreground_process_command_name();
-            let cursor = terminal.last_content().cursor.point;
+            let content_digest = {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                terminal.last_n_non_empty_lines(40).hash(&mut hasher);
+                hasher.finish()
+            };
 
-            let last_activity =
-                self.activity.entry(terminal_view.entity_id()).or_insert((cursor, now));
-            if last_activity.0 != cursor {
-                *last_activity = (cursor, now);
+            let last_activity = self
+                .activity
+                .entry(terminal_view.entity_id())
+                .or_insert((content_digest, now));
+            if last_activity.0 != content_digest {
+                *last_activity = (content_digest, now);
             }
             let quiet_for = now.saturating_duration_since(last_activity.1);
             let agent = foreground.as_deref().is_some_and(is_agent);
@@ -237,32 +241,23 @@ impl SessionsPanel {
                 SessionStatus::NeedsInput { .. },
             ) = (&previous_status, &new_status)
             {
-                if is_agent(command) && now.saturating_duration_since(*since) >= threshold {
+                if is_agent(command)
+                    && now.saturating_duration_since(*since) >= Self::agent_notify_threshold()
+                {
                     if !focused {
                         cx.default_global::<SharedSessionState>()
                             .unseen
                             .insert(terminal_id);
-                    }
-                    let title = terminal_view.read(cx).terminal().read(cx).title(true);
-                    if !window_active {
-                        cx.show_system_notification(SystemNotification {
-                            tag: format!("hive-session-{terminal_id}").into(),
-                            title: format!("{command} is waiting for you").into(),
-                            body: title.into(),
-                            actions: Vec::new(),
-                        });
-                    } else if !focused && let Some(workspace) = self.workspace.upgrade() {
-                        let id = NotificationId::composite::<Self>((
+                        let title = terminal_view.read(cx).terminal().read(cx).title(true);
+                        self.notify_session_activity(
+                            &terminal_view,
+                            &workspace,
+                            window_active,
                             "session-needs-input",
-                            terminal_id,
-                        ));
-                        workspace.update(cx, |workspace, cx| {
-                            workspace.show_toast(
-                                Toast::new(id, format!("{command} is waiting for you"))
-                                    .autohide(),
-                                cx,
-                            );
-                        });
+                            format!("{command} is waiting for you"),
+                            title,
+                            cx,
+                        );
                     }
                 }
             }
@@ -354,6 +349,18 @@ impl SessionsPanel {
     // SettingsContent when someone asks to configure it in the UI
     fn auto_follow_enabled() -> bool {
         std::env::var("HIVE_NO_AUTO_REPO").is_err()
+    }
+
+    /// Minimum time an agent must have been working before its going-quiet
+    /// notifies. Much lower than `notify_threshold` — a 10-second claude
+    /// answer completing while you look elsewhere is exactly what you want
+    /// pinged about, whereas 10-second shell commands are noise.
+    fn agent_notify_threshold() -> Duration {
+        std::env::var("HIVE_AGENT_NOTIFY_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(5))
     }
 
     fn auto_detach_after() -> Duration {
@@ -644,6 +651,56 @@ impl SessionsPanel {
                     workspace.activate_item(&terminal_view, true, true, window, cx);
                 });
             }))
+    }
+
+    /// Notifies about activity in a session: always a system notification
+    /// (macOS shows banners even for the frontmost app), plus — while the
+    /// window is active — an in-app toast with a jump-to-session action.
+    /// The toast is shown on the window's ACTIVE workspace: toasts render
+    /// per-workspace, so one shown on a background session would be
+    /// invisible until the user happened to switch there.
+    fn notify_session_activity(
+        &self,
+        terminal_view: &Entity<TerminalView>,
+        session_workspace: &Entity<Workspace>,
+        window_active: bool,
+        tag_scope: &'static str,
+        message: String,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let terminal_id = terminal_view.entity_id();
+        cx.show_system_notification(SystemNotification {
+            tag: format!("hive-session-{terminal_id}").into(),
+            title: message.clone().into(),
+            body: body.into(),
+            actions: Vec::new(),
+        });
+
+        if window_active {
+            let toast_target = session_workspace
+                .read(cx)
+                .multi_workspace()
+                .and_then(|multi_workspace| multi_workspace.upgrade())
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+                .unwrap_or_else(|| session_workspace.clone());
+            let open_workspace = session_workspace.clone();
+            let open_terminal = terminal_view.clone();
+            let id = NotificationId::composite::<Self>((tag_scope, terminal_id));
+            toast_target.update(cx, |workspace, cx| {
+                workspace.show_toast(
+                    Toast::new(id, message)
+                        .on_click("Open Session", move |window, cx| {
+                            Self::activate_workspace(&open_workspace, window, cx);
+                            open_workspace.update(cx, |workspace, cx| {
+                                workspace.activate_item(&open_terminal, true, true, window, cx);
+                            });
+                        })
+                        .autohide(),
+                    cx,
+                );
+            });
+        }
     }
 
     /// Makes `workspace` the window's active workspace (swapping the whole

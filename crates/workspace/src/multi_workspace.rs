@@ -1530,6 +1530,15 @@ impl MultiWorkspace {
             workspace.refresh_window_state(window, cx);
         });
 
+        // hive: carry the dock layout (which panels are open, their sizes)
+        // from the outgoing workspace to the incoming one. Sessions should
+        // feel like one window whose tab strip changes — without this, each
+        // workspace's docks diverge and switching reads as a window change.
+        let outgoing_docks = old_active_workspace.read(cx).capture_dock_state(window, cx);
+        self.active_workspace.update(cx, |workspace, cx| {
+            workspace.set_dock_structure(outgoing_docks, window, cx);
+        });
+
         cx.emit(MultiWorkspaceEvent::ActiveWorkspaceChanged { source_workspace });
         self.serialize(cx);
         self.focus_active_workspace(window, cx);
