@@ -733,6 +733,81 @@ impl Render for SessionsPanel {
         });
 
         let mut root = v_flex().size_full().p_1();
+
+        // Header: panel label plus the two creation entry points — a new
+        // terminal inside the current session, and a new session (project).
+        root = root.child(
+            h_flex()
+                .px_1()
+                .pb_1()
+                .justify_between()
+                .child(
+                    Label::new("Sessions")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            IconButton::new("new-terminal-in-session", IconName::Terminal)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action(
+                                        "New Terminal in Session",
+                                        &NewSession,
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    let Some(workspace) = this.workspace.upgrade() else {
+                                        return;
+                                    };
+                                    workspace.update(cx, |workspace, cx| {
+                                        let cwd = terminal_view::default_working_directory(
+                                            workspace, cx,
+                                        );
+                                        TerminalPanel::add_center_terminal(
+                                            workspace,
+                                            window,
+                                            cx,
+                                            move |project, cx| {
+                                                project.create_terminal_shell(cwd, cx)
+                                            },
+                                        )
+                                        .detach_and_log_err(cx);
+                                    });
+                                })),
+                        )
+                        .child(
+                            IconButton::new("new-session", IconName::Plus)
+                                .icon_size(IconSize::Small)
+                                .icon_color(Color::Muted)
+                                .tooltip(|_window, cx| {
+                                    Tooltip::for_action(
+                                        "New Session (Open Project)",
+                                        &zed_actions::OpenRecent::default(),
+                                        cx,
+                                    )
+                                })
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    let Some(workspace) = this.workspace.upgrade() else {
+                                        return;
+                                    };
+                                    workspace
+                                        .read(cx)
+                                        .focus_handle(cx)
+                                        .dispatch_action(
+                                            &zed_actions::OpenRecent::default(),
+                                            window,
+                                            cx,
+                                        );
+                                })),
+                        ),
+                ),
+        );
+
         for (name, workspace, terminals) in self.session_groups(cx) {
             let is_active = active_workspace.as_ref() == Some(&workspace);
             let mut header = h_flex().gap_2().child(
