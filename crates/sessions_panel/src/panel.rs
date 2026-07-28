@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -34,7 +34,22 @@ pub struct SessionsPanel {
     /// spinners), which is one more reason `NeedsInput` is a heuristic, not a
     /// fact.
     activity: HashMap<EntityId, (terminal::Point, Instant)>,
+    /// Repos this panel attached to the workspace because a terminal cd'd
+    /// into them, and when a terminal was last seen inside each. Only these
+    /// are ever auto-removed — folders the user opened are never touched.
+    auto_attached_repos: HashMap<PathBuf, Instant>,
+    /// cwd → enclosing repo root, so the `.git` walk runs once per cwd
+    /// rather than on every poll.
+    repo_root_cache: HashMap<PathBuf, Option<PathBuf>>,
     _git_subscription: Subscription,
+}
+
+/// Walks up from `path` to the enclosing git repository root. `.git` may be
+/// a directory or, for linked worktrees, a file — `exists()` covers both.
+fn repo_root_for(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 pub fn init(cx: &mut App) {
@@ -99,6 +114,8 @@ impl SessionsPanel {
                     window_handle,
                     trackers: HashMap::default(),
                     activity: HashMap::default(),
+                    auto_attached_repos: HashMap::default(),
+                    repo_root_cache: HashMap::default(),
                     _git_subscription: git_subscription,
                 }
             })
@@ -136,6 +153,14 @@ impl SessionsPanel {
             .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
         self.activity
             .retain(|id, _| terminals.iter().any(|terminal| terminal.entity_id() == *id));
+
+        let cwds: Vec<PathBuf> = terminals
+            .iter()
+            .filter_map(|terminal_view| {
+                terminal_view.read(cx).terminal().read(cx).working_directory()
+            })
+            .collect();
+        self.follow_terminal_repos(&cwds, cx);
 
         for terminal_view in terminals {
             let terminal = terminal_view.read(cx).terminal().read(cx);
@@ -181,6 +206,110 @@ impl SessionsPanel {
             }
         }
         cx.notify(); // re-render badges
+    }
+
+    // ponytail: env var opt-out like notify_threshold; wire into
+    // SettingsContent when someone asks to configure it in the UI
+    fn auto_follow_enabled() -> bool {
+        std::env::var("HIVE_NO_AUTO_REPO").is_err()
+    }
+
+    fn auto_detach_after() -> Duration {
+        std::env::var("HIVE_AUTO_DETACH_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::from_secs(30))
+    }
+
+    /// Keeps the workspace's folders in sync with where the terminals are.
+    /// A terminal whose cwd is inside a git repo the project doesn't cover
+    /// attaches that repo as a visible worktree, so the git UI (diffs,
+    /// stashes, history) works there without an explicit "open as project".
+    /// A repo only Hive attached is removed again once no terminal has been
+    /// inside it for [`Self::auto_detach_after`] and none of its files are
+    /// open in a pane.
+    fn follow_terminal_repos(&mut self, cwds: &[PathBuf], cx: &mut Context<Self>) {
+        if !Self::auto_follow_enabled() {
+            return;
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let project = workspace.read(cx).project().clone();
+        if !project.read(cx).is_local() {
+            return;
+        }
+        let now = Instant::now();
+
+        self.repo_root_cache.retain(|cwd, _| cwds.contains(cwd));
+        for cwd in cwds {
+            let root = self
+                .repo_root_cache
+                .entry(cwd.clone())
+                .or_insert_with(|| repo_root_for(cwd))
+                .clone();
+            let Some(root) = root else { continue };
+            if let Some(last_seen) = self.auto_attached_repos.get_mut(&root) {
+                *last_seen = now;
+                continue;
+            }
+            // Never attach the home directory: scanning it is expensive and
+            // almost certainly not what a `cd ~` meant.
+            if root.as_path() == util::paths::home_dir().as_path() {
+                continue;
+            }
+            if project
+                .read(cx)
+                .project_path_for_absolute_path(cwd, cx)
+                .is_some()
+            {
+                continue;
+            }
+            log::info!("sessions_panel: auto-attaching repo {}", root.display());
+            self.auto_attached_repos.insert(root.clone(), now);
+            project
+                .update(cx, |project, cx| project.create_worktree(&root, true, cx))
+                .detach_and_log_err(cx);
+        }
+
+        let detach_after = Self::auto_detach_after();
+        let mut detached = Vec::new();
+        for (root, last_seen) in &self.auto_attached_repos {
+            if cwds.iter().any(|cwd| cwd.starts_with(root)) {
+                continue;
+            }
+            if now.saturating_duration_since(*last_seen) < detach_after {
+                continue;
+            }
+            let worktree_id = project.read(cx).worktrees(cx).find_map(|worktree| {
+                let worktree = worktree.read(cx);
+                (worktree.abs_path().as_ref() == root.as_path()).then(|| worktree.id())
+            });
+            match worktree_id {
+                // The user already removed (or attach failed) — just forget it.
+                None => detached.push(root.clone()),
+                Some(worktree_id) => {
+                    let has_open_items = workspace.read(cx).items(cx).any(|item| {
+                        item.project_path(cx)
+                            .is_some_and(|path| path.worktree_id == worktree_id)
+                    });
+                    if !has_open_items {
+                        log::info!(
+                            "sessions_panel: auto-detaching repo {}",
+                            root.display()
+                        );
+                        project.update(cx, |project, cx| {
+                            project.remove_worktree(worktree_id, cx)
+                        });
+                        detached.push(root.clone());
+                    }
+                }
+            }
+        }
+        for root in detached {
+            self.auto_attached_repos.remove(&root);
+        }
     }
 
     /// All terminal items in the window's center panes, grouped by
