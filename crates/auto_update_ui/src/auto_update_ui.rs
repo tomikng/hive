@@ -60,6 +60,31 @@ struct ReleaseNotesBody {
     release_notes: String,
 }
 
+/// A GitHub release, as returned by `/releases/tags/{tag}`.
+#[derive(Deserialize)]
+struct GithubReleaseNotes {
+    name: Option<String>,
+    tag_name: String,
+    body: Option<String>,
+}
+
+impl From<GithubReleaseNotes> for ReleaseNotesBody {
+    fn from(release: GithubReleaseNotes) -> Self {
+        let title = release
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| format!("Hive {}", release.tag_name));
+        let release_notes = release
+            .body
+            .filter(|body| !body.trim().is_empty())
+            .unwrap_or_else(|| "This release has no notes.".to_string());
+        Self {
+            title,
+            release_notes,
+        }
+    }
+}
+
 fn notify_release_notes_failed_to_show(
     workspace: &mut Workspace,
     _window: &mut Window,
@@ -108,12 +133,11 @@ fn view_release_notes_locally(
 
     let version = AppVersion::global(cx).to_string();
 
+    // hive: notes come from our own GitHub release for this version's tag,
+    // not zed.dev (whose /api/release_notes matches Zed's ancient 0.1.x
+    // releases for our version numbers and renders blank).
     let client = client::Client::global(cx).http_client();
-    let url = client.build_url(&format!(
-        "/api/release_notes/v2/{}/{}",
-        release_channel.dev_name(),
-        version
-    ));
+    let url = format!("https://api.github.com/repos/tomikng/hive/releases/tags/v{version}");
 
     let markdown = workspace
         .app_state()
@@ -133,7 +157,9 @@ fn view_release_notes_locally(
         let mut body = Vec::new();
         response.body_mut().read_to_end(&mut body).await.ok();
 
-        let body: serde_json::Result<ReleaseNotesBody> = serde_json::from_slice(body.as_slice());
+        let body: serde_json::Result<ReleaseNotesBody> =
+            serde_json::from_slice::<GithubReleaseNotes>(body.as_slice())
+                .map(ReleaseNotesBody::from);
 
         let res: Option<()> = maybe!(async {
             let body = body.ok()?;

@@ -2181,11 +2181,19 @@ impl GitPanel {
                     let task = workspace.update(cx, |workspace, cx| {
                         workspace
                             .project()
-                            .update(cx, |project, cx| project.trash_file(path, cx))
+                            .update(cx, |project, cx| project.trash_file(path.clone(), cx))
                     })?;
-                    if let Some(task) = task {
-                        task.await?;
-                    }
+                    // hive: `trash_file` yields None when the path has no
+                    // worktree entry (e.g. the file lives under a scan
+                    // exclusion). Silently succeeding there makes the Trash
+                    // button look dead — report it instead.
+                    match task {
+                        Some(task) => task.await?,
+                        None => anyhow::bail!(
+                            "{} is not part of a scanned worktree, so Hive can't trash it",
+                            path.path.display(PathStyle::local())
+                        ),
+                    };
                     Ok(())
                 })
                 .detach_and_prompt_err(

@@ -336,23 +336,20 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
     }
 }
 
+// hive: release notes live on our GitHub releases, not zed.dev.
 pub fn release_notes_url(cx: &mut App) -> Option<String> {
     let release_channel = ReleaseChannel::try_global(cx)?;
     let url = match release_channel {
         ReleaseChannel::Stable | ReleaseChannel::Preview => {
             let auto_updater = AutoUpdater::get(cx)?;
-            let auto_updater = auto_updater.read(cx);
-            let mut current_version = auto_updater.current_version.clone();
+            let mut current_version = auto_updater.read(cx).current_version.clone();
             current_version.pre = semver::Prerelease::EMPTY;
             current_version.build = semver::BuildMetadata::EMPTY;
-            let release_channel = release_channel.dev_name();
-            let path = format!("/releases/{release_channel}/{current_version}");
-            auto_updater.client.http_client().build_url(&path)
+            format!("https://github.com/tomikng/hive/releases/tag/v{current_version}")
         }
-        ReleaseChannel::Nightly => {
-            "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+        ReleaseChannel::Nightly | ReleaseChannel::Dev => {
+            "https://github.com/tomikng/hive/commits/main/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
     Some(url)
 }
