@@ -9,7 +9,9 @@ use gpui::{
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
-use ui::{CommonAnimationExt as _, Indicator, ListItem, Tooltip, prelude::*};
+use ui::{
+    CommonAnimationExt as _, ContextMenu, Indicator, ListItem, PopoverMenu, Tooltip, prelude::*,
+};
 use workspace::{
     Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
@@ -507,6 +509,13 @@ impl SessionsPanel {
         let Some(own_workspace) = self.workspace.upgrade() else {
             return Vec::new();
         };
+        Self::session_groups_in(&own_workspace, cx)
+    }
+
+    fn session_groups_in(
+        own_workspace: &Entity<Workspace>,
+        cx: &App,
+    ) -> Vec<(String, Entity<Workspace>, Vec<Entity<TerminalView>>)> {
         let workspaces: Vec<Entity<Workspace>> = own_workspace
             .read(cx)
             .multi_workspace()
@@ -803,6 +812,101 @@ impl Render for SessionsPanel {
                 .child(
                     h_flex()
                         .gap_1()
+                        .child({
+                            let unseen_count = cx
+                                .try_global::<SharedSessionState>()
+                                .map(|shared| shared.unseen.len())
+                                .unwrap_or(0);
+                            let menu_workspace = self.workspace.clone();
+                            h_flex()
+                                .child(
+                                    PopoverMenu::new("session-notifications")
+                                        .trigger(
+                                            IconButton::new(
+                                                "session-notifications-bell",
+                                                IconName::Bell,
+                                            )
+                                            .icon_size(IconSize::Small)
+                                            .icon_color(if unseen_count > 0 {
+                                                Color::Accent
+                                            } else {
+                                                Color::Muted
+                                            }),
+                                        )
+                                        .menu(move |window, cx| {
+                                            let own = menu_workspace.upgrade()?;
+                                            let unseen = cx
+                                                .try_global::<SharedSessionState>()
+                                                .map(|shared| shared.unseen.clone())
+                                                .unwrap_or_default();
+                                            let mut entries = Vec::new();
+                                            for (name, workspace, terminals) in
+                                                Self::session_groups_in(&own, cx)
+                                            {
+                                                for terminal_view in terminals {
+                                                    if unseen
+                                                        .contains(&terminal_view.entity_id())
+                                                    {
+                                                        let title = terminal_view
+                                                            .read(cx)
+                                                            .terminal()
+                                                            .read(cx)
+                                                            .title(true);
+                                                        entries.push((
+                                                            format!("{name} · {title}"),
+                                                            workspace.clone(),
+                                                            terminal_view,
+                                                        ));
+                                                    }
+                                                }
+                                            }
+                                            Some(ContextMenu::build(
+                                                window,
+                                                cx,
+                                                |mut menu, _window, _cx| {
+                                                    if entries.is_empty() {
+                                                        menu = menu.header("No new activity");
+                                                    } else {
+                                                        menu = menu.header("Finished sessions");
+                                                        for (label, workspace, terminal_view) in
+                                                            entries
+                                                        {
+                                                            menu = menu.entry(
+                                                                label,
+                                                                None,
+                                                                move |window, cx| {
+                                                                    cx.default_global::<SharedSessionState>()
+                                                                        .unseen
+                                                                        .remove(&terminal_view.entity_id());
+                                                                    Self::activate_workspace(
+                                                                        &workspace, window, cx,
+                                                                    );
+                                                                    workspace.update(cx, |workspace, cx| {
+                                                                        workspace.activate_item(
+                                                                            &terminal_view,
+                                                                            true,
+                                                                            true,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    });
+                                                                },
+                                                            );
+                                                        }
+                                                    }
+                                                    menu
+                                                },
+                                            ))
+                                        }),
+                                )
+                                .when(unseen_count > 0, |this| {
+                                    this.child(
+                                        Label::new(unseen_count.to_string())
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                    )
+                                })
+                        })
                         .child(
                             IconButton::new("new-terminal-in-session", IconName::Terminal)
                                 .icon_size(IconSize::Small)
