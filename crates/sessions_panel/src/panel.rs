@@ -730,7 +730,7 @@ impl SessionsPanel {
                 )
                 .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
-                .tooltip(Tooltip::text("Close Session"))
+                .tooltip(Tooltip::text("Close Terminal"))
                 .on_click(cx.listener(move |_this, _event, window, cx| {
                     cx.stop_propagation();
                     close_workspace.update(cx, |workspace, cx| {
@@ -1039,9 +1039,38 @@ impl Render for SessionsPanel {
                 );
             }
             let header_workspace = workspace.clone();
+            let close_session_workspace = workspace.clone();
             root = root.child(
                 ListItem::new(("session-group", workspace.entity_id()))
                     .child(header)
+                    .end_slot_on_hover(
+                        IconButton::new(
+                            ("close-session-group", workspace.entity_id()),
+                            IconName::Close,
+                        )
+                        .icon_size(IconSize::XSmall)
+                        .icon_color(Color::Muted)
+                        .tooltip(Tooltip::text("Close Session"))
+                        .on_click(cx.listener(move |_this, _event, window, cx| {
+                            cx.stop_propagation();
+                            let Some(multi_workspace) = close_session_workspace
+                                .read(cx)
+                                .multi_workspace()
+                                .and_then(|multi_workspace| multi_workspace.upgrade())
+                            else {
+                                return;
+                            };
+                            multi_workspace
+                                .update(cx, |multi_workspace, cx| {
+                                    multi_workspace.close_workspace(
+                                        &close_session_workspace,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .detach_and_log_err(cx);
+                        })),
+                    )
                     .on_click(cx.listener(move |_this, _event, window, cx| {
                         Self::activate_workspace(&header_workspace, window, cx);
                     })),
