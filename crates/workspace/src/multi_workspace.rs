@@ -1475,6 +1475,33 @@ impl MultiWorkspace {
         cx.notify();
     }
 
+    /// hive: moves `workspace` to `target`'s position in the rail, shifting the
+    /// rest along — the sessions panel's drag-to-reorder.
+    ///
+    /// Only retained workspaces have a position; an active workspace that was
+    /// never retained is rendered last and can't take part in a reorder.
+    pub fn move_workspace(
+        &mut self,
+        workspace: &Entity<Workspace>,
+        target: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        if workspace == target {
+            return;
+        }
+        let position = |needle: &Entity<Workspace>| {
+            self.retained_workspaces
+                .iter()
+                .position(|retained| retained == needle)
+        };
+        let (Some(from), Some(to)) = (position(workspace), position(target)) else {
+            return;
+        };
+        let workspace = self.retained_workspaces.remove(from);
+        self.retained_workspaces.insert(to, workspace);
+        cx.notify();
+    }
+
     /// Ensures the workspace is in the multiworkspace and makes it the active one.
     pub fn activate(
         &mut self,

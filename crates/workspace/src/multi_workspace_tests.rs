@@ -92,6 +92,71 @@ async fn test_sidebar_disabled_when_disable_ai_is_enabled(cx: &mut TestAppContex
 }
 
 #[gpui::test]
+async fn test_move_workspace_reorders_the_rail(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_c", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    let project_c = Project::test(fs, ["/root_c".as_ref()], cx).await;
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    let (workspace_b, workspace_c) =
+        multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+            (
+                multi_workspace.test_add_workspace(project_b, window, cx),
+                multi_workspace.test_add_workspace(project_c, window, cx),
+            )
+        });
+    cx.run_until_parked();
+
+    let order = |multi_workspace: &MultiWorkspace| {
+        multi_workspace.workspaces().cloned().collect::<Vec<_>>()
+    };
+    let initial = multi_workspace.read_with(cx, |multi_workspace, _| order(multi_workspace));
+    assert_eq!(
+        initial,
+        vec![
+            initial[0].clone(),
+            workspace_b.clone(),
+            workspace_c.clone()
+        ]
+    );
+
+    let workspace_a = initial[0].clone();
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.move_workspace(&workspace_c, &workspace_a, cx);
+    });
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            order(multi_workspace),
+            vec![
+                workspace_c.clone(),
+                workspace_a.clone(),
+                workspace_b.clone()
+            ]
+        );
+    });
+
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        multi_workspace.move_workspace(&workspace_c, &workspace_b, cx);
+    });
+    multi_workspace.read_with(cx, |multi_workspace, _| {
+        assert_eq!(
+            order(multi_workspace),
+            vec![
+                workspace_a.clone(),
+                workspace_b.clone(),
+                workspace_c.clone()
+            ]
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_multi_workspace_collapses_when_agent_is_disabled(cx: &mut TestAppContext) {
     init_test(cx);
     let fs = FakeFs::new(cx.executor());

@@ -79,6 +79,25 @@ pub struct SessionsPanel {
 /// that first sees the repaint still absorbs it.
 const FOCUS_REPAINT_GRACE: Duration = Duration::from_secs(3);
 
+/// A session row picked up in the rail, carried until it's dropped on another
+/// row.
+#[derive(Clone)]
+struct DraggedSession {
+    workspace: Entity<Workspace>,
+    name: SharedString,
+}
+
+impl Render for DraggedSession {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Label::new(self.name.clone()).size(LabelSize::Small))
+    }
+}
+
 /// The session's root: its first visible worktree — the project this session
 /// was opened as — regardless of where its terminals have wandered since.
 fn session_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
@@ -837,6 +856,29 @@ impl SessionsPanel {
         }
     }
 
+    /// Moves the dragged session to `target`'s place in the rail. The order is
+    /// the window's retained-workspace order, so it lasts as long as the
+    /// window does but isn't serialized.
+    fn move_session(
+        &self,
+        dragged: &Entity<Workspace>,
+        target: &Entity<Workspace>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| workspace.read(cx).multi_workspace())
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+        else {
+            return;
+        };
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.move_workspace(dragged, target, cx);
+        });
+        cx.notify();
+    }
+
     /// Makes `workspace` the window's active workspace (swapping the whole
     /// tab strip to that session), if it isn't already.
     fn activate_workspace(workspace: &Entity<Workspace>, window: &mut Window, cx: &mut App) {
@@ -1052,7 +1094,7 @@ impl Render for SessionsPanel {
                     repository.read(cx).work_directory_abs_path.to_path_buf()
                 });
             let mut header = h_flex().gap_2().child(
-                Label::new(name)
+                Label::new(name.clone())
                     .size(LabelSize::Small)
                     .color(if is_active { Color::Default } else { Color::Muted }),
             );
@@ -1068,7 +1110,26 @@ impl Render for SessionsPanel {
             }
             let header_workspace = workspace.clone();
             let close_session_workspace = workspace.clone();
+            let dragged_session = DraggedSession {
+                workspace: workspace.clone(),
+                name: name.into(),
+            };
+            let drop_target = workspace.clone();
             root = root.child(
+                div()
+                    .id(("session-group-drag", workspace.entity_id()))
+                    .on_drag(dragged_session, |session, _offset, _window, cx| {
+                        cx.new(|_| session.clone())
+                    })
+                    .drag_over::<DraggedSession>(|style, _, _, cx| {
+                        style.bg(cx.theme().colors().drop_target_background)
+                    })
+                    .on_drop(cx.listener(
+                        move |this, dragged: &DraggedSession, _window, cx| {
+                            this.move_session(&dragged.workspace, &drop_target, cx);
+                        },
+                    ))
+                    .child(
                 ListItem::new(("session-group", workspace.entity_id()))
                     .child(header)
                     .end_slot_on_hover(
@@ -1102,6 +1163,7 @@ impl Render for SessionsPanel {
                     .on_click(cx.listener(move |_this, _event, window, cx| {
                         Self::activate_workspace(&header_workspace, window, cx);
                     })),
+                    ),
             );
             for terminal_view in terminals {
                 root = root.child(self.render_session(
