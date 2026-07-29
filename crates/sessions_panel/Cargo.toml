@@ -11,6 +11,7 @@ path = "src/sessions_panel.rs"
 [dependencies]
 anyhow.workspace = true
 db.workspace = true
+file_icons.workspace = true
 git_ui.workspace = true
 gpui.workspace = true
 log.workspace = true
