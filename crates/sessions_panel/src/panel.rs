@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, App, AsyncWindowContext, Context, DismissEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification,
+    EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render, Subscription,
+    SystemNotification,
     WeakEntity, Window, actions, anchored, deferred, px,
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
@@ -285,6 +286,9 @@ impl SessionsPanel {
                             }
                             terminal::Event::Bell => {
                                 this.on_agent_signal(&terminal_view, None, cx);
+                            }
+                            terminal::Event::Interrupt => {
+                                this.on_interrupt(terminal_view.entity_id(), cx);
                             }
                             _ => {}
                         }
@@ -949,21 +953,14 @@ impl SessionsPanel {
                 .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
                 .tooltip(Tooltip::text("Close Terminal"))
-                .on_click(cx.listener(move |_this, _event, window, cx| {
+                .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
-                    close_workspace.update(cx, |workspace, cx| {
-                        if let Some(pane) = workspace.pane_for(&close_terminal_view) {
-                            pane.update(cx, |pane, cx| {
-                                pane.close_item_by_id(
-                                    close_terminal_view.entity_id(),
-                                    workspace::SaveIntent::Close,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .detach_and_log_err(cx);
-                        }
-                    });
+                    this.close_terminal(
+                        close_terminal_view.clone(),
+                        close_workspace.clone(),
+                        window,
+                        cx,
+                    );
                 })),
             )
             .on_click(cx.listener(move |_this, _event, window, cx| {
@@ -990,6 +987,7 @@ impl SessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let panel = cx.weak_entity();
         let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
             menu.entry("Rename Terminal", None, {
                 let terminal_view = terminal_view.clone();
@@ -1024,20 +1022,18 @@ impl SessionsPanel {
             .entry("Close Terminal", None, {
                 let terminal_view = terminal_view.clone();
                 let workspace = workspace.clone();
+                let panel = panel.clone();
                 move |window, cx| {
-                    workspace.update(cx, |workspace, cx| {
-                        if let Some(pane) = workspace.pane_for(&terminal_view) {
-                            pane.update(cx, |pane, cx| {
-                                pane.close_item_by_id(
-                                    terminal_view.entity_id(),
-                                    workspace::SaveIntent::Close,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .detach_and_log_err(cx);
-                        }
-                    });
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.close_terminal(
+                                terminal_view.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
                 }
             })
         });
@@ -1100,6 +1096,124 @@ impl SessionsPanel {
                 );
             });
         }
+    }
+
+    /// The user interrupted whatever was running. Nothing announces that —
+    /// an interrupted turn fires no `Stop` hook — so the session would have
+    /// gone on claiming it was working. No notification: the person who needs
+    /// to know is the one who pressed the key.
+    fn on_interrupt(&mut self, terminal_id: EntityId, cx: &mut Context<Self>) {
+        let Some(tracker) = self.trackers.get_mut(&terminal_id) else {
+            return;
+        };
+        tracker.signal_turn_ended();
+        let status = tracker.status().clone();
+        cx.default_global::<SharedSessionState>()
+            .statuses
+            .insert(terminal_id, status);
+        cx.notify();
+    }
+
+    /// Closes a terminal, asking first when something is running in it.
+    ///
+    /// The rail is the one place a terminal can be closed without looking at
+    /// it, so an agent mid-turn or a long build would otherwise go without a
+    /// word.
+    fn close_terminal(
+        &mut self,
+        terminal_view: Entity<TerminalView>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let running = cx
+            .try_global::<SharedSessionState>()
+            .and_then(|shared| shared.statuses.get(&terminal_view.entity_id()))
+            .and_then(|status| match status {
+                SessionStatus::Running { command, .. }
+                | SessionStatus::Working { command, .. }
+                | SessionStatus::NeedsInput { command, .. } => Some(command.clone()),
+                SessionStatus::Idle => None,
+            });
+
+        let confirm = running.map(|command| {
+            window.prompt(
+                PromptLevel::Warning,
+                &format!("{command} is still running in this terminal."),
+                Some("Closing it will end the process."),
+                &["Close Terminal", "Cancel"],
+                cx,
+            )
+        });
+
+        cx.spawn_in(window, async move |_this, cx| {
+            if let Some(confirm) = confirm
+                && confirm.await.ok() != Some(0)
+            {
+                return;
+            }
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let Some(pane) = workspace.pane_for(&terminal_view) else {
+                        return;
+                    };
+                    pane.update(cx, |pane, cx| {
+                        pane.close_item_by_id(
+                            terminal_view.entity_id(),
+                            workspace::SaveIntent::Close,
+                            window,
+                            cx,
+                        )
+                    })
+                    .detach_and_log_err(cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Closes a whole session, always asking first: it takes every terminal in
+    /// it with it, running or not.
+    fn close_session(
+        &mut self,
+        workspace: Entity<Workspace>,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminals = workspace.read(cx).items_of_type::<TerminalView>(cx).count();
+        let detail = match terminals {
+            0 => "The session has no terminals open.".to_string(),
+            1 => "Its terminal will be closed.".to_string(),
+            count => format!("All {count} of its terminals will be closed."),
+        };
+        let confirm = window.prompt(
+            PromptLevel::Warning,
+            &format!("Close the {name} session?"),
+            Some(&detail),
+            &["Close Session", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |_this, cx| {
+            if confirm.await.ok() != Some(0) {
+                return;
+            }
+            let Some(multi_workspace) = workspace
+                .read_with(cx, |workspace, _| workspace.multi_workspace().cloned())
+                .and_then(|multi_workspace| multi_workspace.upgrade())
+
+            else {
+                return;
+            };
+            let closed = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+                multi_workspace.close_workspace(&workspace, window, cx)
+            });
+            if let Ok(closed) = closed {
+                closed.await.log_err();
+            }
+        })
+        .detach();
     }
 
     /// Moves the dragged session to `target`'s place in the rail. The order is
@@ -1365,6 +1479,7 @@ impl Render for SessionsPanel {
                 .is_some_and(|shared| shared.collapsed.contains(&session_id));
             let header_workspace = workspace.clone();
             let close_session_workspace = workspace.clone();
+            let close_session_name: SharedString = name.clone().into();
             let dragged_session = DraggedSession {
                 workspace: workspace.clone(),
                 name: name.into(),
@@ -1413,27 +1528,15 @@ impl Render for SessionsPanel {
                                 .icon_size(IconSize::XSmall)
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text("Close Session"))
-                                .on_click(cx.listener(
-                                    move |_this, _event, window, cx| {
-                                        cx.stop_propagation();
-                                        let Some(multi_workspace) = close_session_workspace
-                                            .read(cx)
-                                            .multi_workspace()
-                                            .and_then(|multi_workspace| multi_workspace.upgrade())
-                                        else {
-                                            return;
-                                        };
-                                        multi_workspace
-                                            .update(cx, |multi_workspace, cx| {
-                                                multi_workspace.close_workspace(
-                                                    &close_session_workspace,
-                                                    window,
-                                                    cx,
-                                                )
-                                            })
-                                            .detach_and_log_err(cx);
-                                    },
-                                )),
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_session(
+                                        close_session_workspace.clone(),
+                                        close_session_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
                             ),
                     ),
             );

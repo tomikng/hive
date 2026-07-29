@@ -1315,6 +1315,9 @@ fn subscribe_for_terminal_events(
             }
 
             match event {
+                // Emitted by this view's own key handling; the sessions panel
+                // is the only listener and it subscribes to the terminal.
+                Event::Interrupt => {}
                 Event::Wakeup => {
                     cx.notify();
                     window.invalidate_character_coordinates();
@@ -1469,6 +1472,14 @@ impl ScrollbarVisibility for TerminalScrollbarSettingsWrapper {
     }
 }
 
+/// The two keystrokes that tell a program running in the terminal to stop:
+/// escape, which is how the coding agents take it, and ctrl-c for everything
+/// else.
+fn is_interrupt(keystroke: &Keystroke) -> bool {
+    (keystroke.key == "escape" && !keystroke.modifiers.modified())
+        || (keystroke.key == "c" && keystroke.modifiers.control)
+}
+
 impl TerminalView {
     /// Attempts to process a keystroke in the terminal. Returns true if handled.
     ///
@@ -1477,10 +1488,14 @@ impl TerminalView {
     /// shell output to automatically trigger a re-render.
     fn process_keystroke(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
         let (handled, vi_mode_enabled) = self.terminal.update(cx, |term, cx| {
-            (
-                term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta),
-                term.vi_mode_enabled(),
-            )
+            let handled =
+                term.try_keystroke(keystroke, TerminalSettings::get_global(cx).option_as_meta);
+            // hive: an interrupted agent stops without saying so — no hook
+            // fires for it — so the keystroke that did it is the signal.
+            if handled && is_interrupt(keystroke) {
+                cx.emit(terminal::Event::Interrupt);
+            }
+            (handled, term.vi_mode_enabled())
         });
 
         if handled && vi_mode_enabled {
