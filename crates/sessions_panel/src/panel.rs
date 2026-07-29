@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyWindowHandle, App, AsyncWindowContext, Context, DismissEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification,
+    EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render, Subscription,
+    SystemNotification,
     WeakEntity, Window, actions, anchored, deferred, px,
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
@@ -286,6 +287,9 @@ impl SessionsPanel {
                             terminal::Event::Bell => {
                                 this.on_agent_signal(&terminal_view, None, cx);
                             }
+                            terminal::Event::Interrupt => {
+                                this.on_interrupt(terminal_view.entity_id(), cx);
+                            }
                             _ => {}
                         }
                     })
@@ -426,13 +430,41 @@ impl SessionsPanel {
             .read(cx)
             .foreground_process_command_name();
 
+        // A turn starting is the one signal that isn't about the user: it says
+        // the agent has work in hand, so it moves the indicator and stops.
+        if let Some(crate::status::TurnMarker::Started) =
+            message.as_deref().and_then(crate::status::turn_marker)
+        {
+            let Some(tracker) = self.trackers.get_mut(&terminal_id) else {
+                return;
+            };
+            tracker.signal_turn_started();
+            let status = tracker.status().clone();
+            cx.default_global::<SharedSessionState>()
+                .statuses
+                .insert(terminal_id, status);
+            cx.notify();
+            return;
+        }
+
         let message = match message {
             Some(message) => {
                 // This session speaks OSC, so its bell stops counting: Claude
                 // Code's `iterm2_with_bell` channel sends both, and the
                 // notification carries the better wording.
                 self.osc_capable.insert(terminal_id);
-                message
+                // A turn ending means the agent wants the user, and is the
+                // only signal that arrives for every such moment — the
+                // notification channel stays quiet for a question asked
+                // mid-turn. Both may fire; they share a notification id, so
+                // the second replaces the first rather than stacking.
+                match crate::status::turn_marker(&message) {
+                    Some(_) => format!(
+                        "{} is waiting for you",
+                        foreground.as_deref().unwrap_or("The agent")
+                    ),
+                    None => message,
+                }
             }
             None => {
                 if self.osc_capable.contains(&terminal_id) {
@@ -457,21 +489,24 @@ impl SessionsPanel {
             .insert(terminal_id, status);
 
         let window_active = self.window_active(cx);
+        // The badge is for sessions you aren't looking at; being asked for
+        // something is worth saying out loud either way, since watching a
+        // session is not the same as waiting on it.
         if !self.session_focused(&workspace, terminal_id, cx) {
             cx.default_global::<SharedSessionState>()
                 .unseen
                 .insert(terminal_id);
-            let session = terminal_view.read(cx).terminal().read(cx).title(true);
-            self.notify_session_activity(
-                terminal_view,
-                &workspace,
-                window_active,
-                "session-needs-input",
-                message,
-                session,
-                cx,
-            );
         }
+        let session = terminal_view.read(cx).terminal().read(cx).title(true);
+        self.notify_session_activity(
+            terminal_view,
+            &workspace,
+            window_active,
+            "session-needs-input",
+            message,
+            session,
+            cx,
+        );
         cx.notify();
     }
 
@@ -499,16 +534,43 @@ impl SessionsPanel {
                 let id = NotificationId::composite::<Self>("claude-notifications");
                 toast_target.update(cx, |workspace, cx| {
                     workspace.show_toast(
-                        Toast::new(id, "Claude Code can't tell Hive when it needs you.").on_click(
-                            "Enable",
-                            |_window, cx| {
-                                cx.background_executor()
-                                    .spawn(async {
-                                        claude_settings::enable_notifications().log_err();
-                                    })
-                                    .detach();
-                            },
-                        ),
+                        Toast::new(
+                            id,
+                            "Claude Code can't tell Hive when it's working or when it needs you.",
+                        )
+                        .on_click("Enable", {
+                            let toast_target = toast_target.downgrade();
+                            move |_window, cx| {
+                                // Say what happened: the write is invisible,
+                                // and Claude Code reads its settings once at
+                                // startup, so nothing changes in the session
+                                // that prompted this.
+                                let toast_target = toast_target.clone();
+                                cx.spawn(async move |cx| {
+                                    let wrote = cx
+                                        .background_executor()
+                                        .spawn(async {
+                                            claude_settings::enable_notifications().log_err()
+                                        })
+                                        .await;
+                                    let message = if wrote.is_some() {
+                                        "Claude Code will report its turns to Hive once you restart it."
+                                    } else {
+                                        "Hive could not write Claude Code's settings — see the log."
+                                    };
+                                    toast_target
+                                        .update(cx, |workspace, cx| {
+                                            let id = NotificationId::composite::<Self>(
+                                                "claude-notifications-result",
+                                            );
+                                            workspace
+                                                .show_toast(Toast::new(id, message).autohide(), cx);
+                                        })
+                                        .ok();
+                                })
+                                .detach();
+                            }
+                        }),
                         cx,
                     );
                 });
@@ -824,12 +886,17 @@ impl SessionsPanel {
             })
             .unwrap_or((SessionStatus::Idle, false));
         let indicator = match &status {
-            // A running agent gets a spinner; plain commands keep the dot.
+            // Only a turn in flight spins. An agent whose TUI is merely open
+            // is waiting on you, and used to spin forever.
+            SessionStatus::Working { .. } => Icon::new(IconName::ArrowCircle)
+                .size(IconSize::XSmall)
+                .color(Color::Accent)
+                .with_keyed_rotate_animation(("session-spinner", terminal_id), 2)
+                .into_any_element(),
             SessionStatus::Running { command, .. } if is_agent(command) => {
-                Icon::new(IconName::ArrowCircle)
+                Icon::new(IconName::Check)
                     .size(IconSize::XSmall)
-                    .color(Color::Accent)
-                    .with_keyed_rotate_animation(("session-spinner", terminal_id), 2)
+                    .color(Color::Success)
                     .into_any_element()
             }
             SessionStatus::Running { .. } => {
@@ -886,21 +953,14 @@ impl SessionsPanel {
                 .icon_size(IconSize::XSmall)
                 .icon_color(Color::Muted)
                 .tooltip(Tooltip::text("Close Terminal"))
-                .on_click(cx.listener(move |_this, _event, window, cx| {
+                .on_click(cx.listener(move |this, _event, window, cx| {
                     cx.stop_propagation();
-                    close_workspace.update(cx, |workspace, cx| {
-                        if let Some(pane) = workspace.pane_for(&close_terminal_view) {
-                            pane.update(cx, |pane, cx| {
-                                pane.close_item_by_id(
-                                    close_terminal_view.entity_id(),
-                                    workspace::SaveIntent::Close,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .detach_and_log_err(cx);
-                        }
-                    });
+                    this.close_terminal(
+                        close_terminal_view.clone(),
+                        close_workspace.clone(),
+                        window,
+                        cx,
+                    );
                 })),
             )
             .on_click(cx.listener(move |_this, _event, window, cx| {
@@ -927,6 +987,7 @@ impl SessionsPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let panel = cx.weak_entity();
         let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
             menu.entry("Rename Terminal", None, {
                 let terminal_view = terminal_view.clone();
@@ -961,20 +1022,18 @@ impl SessionsPanel {
             .entry("Close Terminal", None, {
                 let terminal_view = terminal_view.clone();
                 let workspace = workspace.clone();
+                let panel = panel.clone();
                 move |window, cx| {
-                    workspace.update(cx, |workspace, cx| {
-                        if let Some(pane) = workspace.pane_for(&terminal_view) {
-                            pane.update(cx, |pane, cx| {
-                                pane.close_item_by_id(
-                                    terminal_view.entity_id(),
-                                    workspace::SaveIntent::Close,
-                                    window,
-                                    cx,
-                                )
-                            })
-                            .detach_and_log_err(cx);
-                        }
-                    });
+                    panel
+                        .update(cx, |panel, cx| {
+                            panel.close_terminal(
+                                terminal_view.clone(),
+                                workspace.clone(),
+                                window,
+                                cx,
+                            );
+                        })
+                        .ok();
                 }
             })
         });
@@ -1037,6 +1096,124 @@ impl SessionsPanel {
                 );
             });
         }
+    }
+
+    /// The user interrupted whatever was running. Nothing announces that —
+    /// an interrupted turn fires no `Stop` hook — so the session would have
+    /// gone on claiming it was working. No notification: the person who needs
+    /// to know is the one who pressed the key.
+    fn on_interrupt(&mut self, terminal_id: EntityId, cx: &mut Context<Self>) {
+        let Some(tracker) = self.trackers.get_mut(&terminal_id) else {
+            return;
+        };
+        tracker.signal_turn_ended();
+        let status = tracker.status().clone();
+        cx.default_global::<SharedSessionState>()
+            .statuses
+            .insert(terminal_id, status);
+        cx.notify();
+    }
+
+    /// Closes a terminal, asking first when something is running in it.
+    ///
+    /// The rail is the one place a terminal can be closed without looking at
+    /// it, so an agent mid-turn or a long build would otherwise go without a
+    /// word.
+    fn close_terminal(
+        &mut self,
+        terminal_view: Entity<TerminalView>,
+        workspace: Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let running = cx
+            .try_global::<SharedSessionState>()
+            .and_then(|shared| shared.statuses.get(&terminal_view.entity_id()))
+            .and_then(|status| match status {
+                SessionStatus::Running { command, .. }
+                | SessionStatus::Working { command, .. }
+                | SessionStatus::NeedsInput { command, .. } => Some(command.clone()),
+                SessionStatus::Idle => None,
+            });
+
+        let confirm = running.map(|command| {
+            window.prompt(
+                PromptLevel::Warning,
+                &format!("{command} is still running in this terminal."),
+                Some("Closing it will end the process."),
+                &["Close Terminal", "Cancel"],
+                cx,
+            )
+        });
+
+        cx.spawn_in(window, async move |_this, cx| {
+            if let Some(confirm) = confirm
+                && confirm.await.ok() != Some(0)
+            {
+                return;
+            }
+            workspace
+                .update_in(cx, |workspace, window, cx| {
+                    let Some(pane) = workspace.pane_for(&terminal_view) else {
+                        return;
+                    };
+                    pane.update(cx, |pane, cx| {
+                        pane.close_item_by_id(
+                            terminal_view.entity_id(),
+                            workspace::SaveIntent::Close,
+                            window,
+                            cx,
+                        )
+                    })
+                    .detach_and_log_err(cx);
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    /// Closes a whole session, always asking first: it takes every terminal in
+    /// it with it, running or not.
+    fn close_session(
+        &mut self,
+        workspace: Entity<Workspace>,
+        name: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let terminals = workspace.read(cx).items_of_type::<TerminalView>(cx).count();
+        let detail = match terminals {
+            0 => "The session has no terminals open.".to_string(),
+            1 => "Its terminal will be closed.".to_string(),
+            count => format!("All {count} of its terminals will be closed."),
+        };
+        let confirm = window.prompt(
+            PromptLevel::Warning,
+            &format!("Close the {name} session?"),
+            Some(&detail),
+            &["Close Session", "Cancel"],
+            cx,
+        );
+
+        cx.spawn_in(window, async move |_this, cx| {
+            if confirm.await.ok() != Some(0) {
+                return;
+            }
+            let Some(multi_workspace) = workspace
+                .read_with(cx, |workspace, _| workspace.multi_workspace().cloned())
+                .and_then(|multi_workspace| multi_workspace.upgrade())
+
+            else {
+                return;
+            };
+            let closed = multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+                multi_workspace.close_workspace(&workspace, window, cx)
+            });
+            if let Ok(closed) = closed {
+                closed.await.log_err();
+            }
+        })
+        .detach();
     }
 
     /// Moves the dragged session to `target`'s place in the rail. The order is
@@ -1302,6 +1479,7 @@ impl Render for SessionsPanel {
                 .is_some_and(|shared| shared.collapsed.contains(&session_id));
             let header_workspace = workspace.clone();
             let close_session_workspace = workspace.clone();
+            let close_session_name: SharedString = name.clone().into();
             let dragged_session = DraggedSession {
                 workspace: workspace.clone(),
                 name: name.into(),
@@ -1350,27 +1528,15 @@ impl Render for SessionsPanel {
                                 .icon_size(IconSize::XSmall)
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text("Close Session"))
-                                .on_click(cx.listener(
-                                    move |_this, _event, window, cx| {
-                                        cx.stop_propagation();
-                                        let Some(multi_workspace) = close_session_workspace
-                                            .read(cx)
-                                            .multi_workspace()
-                                            .and_then(|multi_workspace| multi_workspace.upgrade())
-                                        else {
-                                            return;
-                                        };
-                                        multi_workspace
-                                            .update(cx, |multi_workspace, cx| {
-                                                multi_workspace.close_workspace(
-                                                    &close_session_workspace,
-                                                    window,
-                                                    cx,
-                                                )
-                                            })
-                                            .detach_and_log_err(cx);
-                                    },
-                                )),
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_session(
+                                        close_session_workspace.clone(),
+                                        close_session_name.clone(),
+                                        window,
+                                        cx,
+                                    );
+                                })),
                             ),
                     ),
             );

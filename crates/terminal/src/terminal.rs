@@ -692,6 +692,10 @@ pub enum Event {
     /// or OSC 777. Coding agents emit this when a turn ends or they need a
     /// decision, carrying wording they wrote for the user.
     Notification(String),
+    /// The user told whatever is running to stop (escape, ctrl-c). An
+    /// interrupted agent reports nothing itself, so this is the only sign that
+    /// the work it was doing has ended.
+    Interrupt,
     Wakeup,
     BlinkChanged(bool),
     SelectionsChanged,

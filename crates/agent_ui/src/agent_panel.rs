@@ -2206,6 +2206,7 @@ impl AgentPanel {
                 }
                 TerminalEvent::BlinkChanged(_)
                 | TerminalEvent::SelectionsChanged
+                | TerminalEvent::Interrupt
                 | TerminalEvent::NewNavigationTarget(_)
                 | TerminalEvent::Open(_) => {}
             },
