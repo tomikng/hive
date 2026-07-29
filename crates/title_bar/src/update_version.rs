@@ -5,6 +5,7 @@ use auto_update::{AutoUpdateStatus, AutoUpdater, UpdateCheckType};
 use gpui::{Empty, Render};
 use semver::Version;
 use ui::{Tooltip, UpdateButton, prelude::*};
+use workspace::{HideStatusItem, ItemHandle, StatusItemView};
 
 pub struct UpdateVersion {
     status: AutoUpdateStatus,
@@ -137,6 +138,22 @@ impl Render for UpdateVersion {
         }
     }
 }
+impl StatusItemView for UpdateVersion {
+    fn set_active_pane_item(
+        &mut self,
+        _active_pane_item: Option<&dyn ItemHandle>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
+    // The pill is inherently conditional: it only exists while an update is
+    // in flight or waiting for a restart, and it has its own dismiss control.
+    fn hide_setting(&self, _cx: &App) -> Option<HideStatusItem> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use semver::Version;

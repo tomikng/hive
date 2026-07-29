@@ -49,7 +49,7 @@ use ui::{
     Avatar, ButtonLike, ContextMenu, ContextMenuEntry, IconWithIndicator, Indicator, PopoverMenu,
     PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
-use update_version::UpdateVersion;
+pub use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
     AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
@@ -419,7 +419,6 @@ impl Render for TitleBar {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 // hive: stripped render_call_controls child
                 .children(self.render_connection_status(status, cx))
-                .child(self.update_version.clone())
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error
