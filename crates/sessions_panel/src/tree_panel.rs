@@ -163,6 +163,23 @@ impl FileTreePanel {
         .detach();
     }
 
+    /// Re-reads every directory the tree is currently showing, keeping what's
+    /// expanded. The cached entries have to go first: `ensure_dir_loaded`
+    /// skips anything already loaded, which is what makes the tree cheap to
+    /// render but also what makes it go stale when files change outside Hive.
+    fn refresh_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.tree_root.clone() else {
+            return;
+        };
+        let mut dirs = self.tree_expanded.clone();
+        dirs.insert(root);
+        for dir in dirs {
+            self.tree_cache.remove(&dir);
+            self.ensure_dir_loaded(dir, cx);
+        }
+        cx.notify();
+    }
+
     fn toggle_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.tree_expanded.remove(&path) {
             cx.notify();
@@ -191,11 +208,26 @@ impl FileTreePanel {
         Some(
             v_flex()
                 .child(
-                    div()
-                        .id("tree-root-header")
+                    h_flex()
                         .px_1()
-                        .child(Label::new(name).size(LabelSize::Small).color(Color::Muted))
-                        .tooltip(Tooltip::text(full_path)),
+                        .justify_between()
+                        .child(
+                            div()
+                                .id("tree-root-header")
+                                .child(
+                                    Label::new(name).size(LabelSize::Small).color(Color::Muted),
+                                )
+                                .tooltip(Tooltip::text(full_path)),
+                        )
+                        .child(
+                            IconButton::new("tree-refresh", IconName::RotateCw)
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Refresh File Tree"))
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.refresh_tree(cx)
+                                })),
+                        ),
                 )
                 .child(rows),
         )

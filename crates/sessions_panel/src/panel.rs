@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
-    Focusable, Pixels, Render, Subscription, SystemNotification, WeakEntity, Window, actions, px,
+    AnyWindowHandle, App, AsyncWindowContext, Context, DismissEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification,
+    WeakEntity, Window, actions, anchored, deferred, px,
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
-use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use terminal_view::{RenameTerminal, TerminalView, terminal_panel::TerminalPanel};
 use ui::{
     CommonAnimationExt as _, ContextMenu, Indicator, ListItem, PopoverMenu, Tooltip, prelude::*,
 };
@@ -32,6 +33,10 @@ actions!(sessions_panel, [ToggleFocus, NewSession]);
 struct SharedSessionState {
     statuses: HashMap<EntityId, SessionStatus>,
     unseen: HashSet<EntityId>,
+    /// Sessions (by workspace) whose terminal rows are folded away. Shared for
+    /// the same reason as the rest: collapsing a session must stay collapsed
+    /// when you switch to another one and its panel takes over the rail.
+    collapsed: HashSet<EntityId>,
 }
 
 impl gpui::Global for SharedSessionState {}
@@ -64,6 +69,7 @@ pub struct SessionsPanel {
     /// notification channel. One offer per window, ever; accepting writes the
     /// setting, after which the check that triggers it stops matching.
     claude_notify_offered: bool,
+    context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
     _git_subscription: Subscription,
 }
 
@@ -175,6 +181,7 @@ impl SessionsPanel {
                     signal_subscriptions: HashMap::default(),
                     osc_capable: HashSet::default(),
                     claude_notify_offered: false,
+                    context_menu: None,
                     _git_subscription: git_subscription,
                 }
             })
@@ -841,10 +848,24 @@ impl SessionsPanel {
             SessionStatus::Idle => Indicator::dot().color(Color::Hidden).into_any_element(),
         };
         let activate_workspace = workspace.clone();
+        let menu_workspace = workspace.clone();
+        let menu_terminal_view = terminal_view.clone();
         let close_workspace = workspace;
         let close_terminal_view = terminal_view.clone();
         ListItem::new(("session", terminal_view.entity_id()))
             .start_slot(indicator)
+            .on_secondary_mouse_down(cx.listener(
+                move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_terminal_context_menu(
+                        menu_terminal_view.clone(),
+                        menu_workspace.clone(),
+                        event.position,
+                        window,
+                        cx,
+                    );
+                },
+            ))
             .child(
                 h_flex()
                     .gap_2()
@@ -891,6 +912,81 @@ impl SessionsPanel {
                     workspace.activate_item(&terminal_view, true, true, window, cx);
                 });
             }))
+    }
+
+    /// Right-click menu for a terminal row.
+    ///
+    /// Rename hands off to the terminal's own rename flow, which draws its
+    /// editor in the tab — so the session is activated first, otherwise the
+    /// rename box would open on a tab strip you can't see.
+    fn deploy_terminal_context_menu(
+        &mut self,
+        terminal_view: Entity<TerminalView>,
+        workspace: Entity<Workspace>,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
+            menu.entry("Rename Terminal", None, {
+                let terminal_view = terminal_view.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    Self::activate_workspace(&workspace, window, cx);
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.activate_item(&terminal_view, true, true, window, cx);
+                    });
+                    terminal_view.update(cx, |terminal_view, cx| {
+                        terminal_view.rename_terminal(&RenameTerminal, window, cx);
+                    });
+                }
+            })
+            .entry("New Terminal in Session", None, {
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        let cwd = session_root(workspace, cx)
+                            .or_else(|| terminal_view::default_working_directory(workspace, cx));
+                        TerminalPanel::add_center_terminal(
+                            workspace,
+                            window,
+                            cx,
+                            move |project, cx| project.create_terminal_shell(cwd, cx),
+                        )
+                        .detach_and_log_err(cx);
+                    });
+                }
+            })
+            .separator()
+            .entry("Close Terminal", None, {
+                let terminal_view = terminal_view.clone();
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        if let Some(pane) = workspace.pane_for(&terminal_view) {
+                            pane.update(cx, |pane, cx| {
+                                pane.close_item_by_id(
+                                    terminal_view.entity_id(),
+                                    workspace::SaveIntent::Close,
+                                    window,
+                                    cx,
+                                )
+                            })
+                            .detach_and_log_err(cx);
+                        }
+                    });
+                }
+            })
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
     }
 
     /// Notifies about activity in a session: always a system notification
@@ -1200,6 +1296,10 @@ impl Render for SessionsPanel {
                         .color(Color::Muted),
                 );
             }
+            let session_id = workspace.entity_id();
+            let collapsed = cx
+                .try_global::<SharedSessionState>()
+                .is_some_and(|shared| shared.collapsed.contains(&session_id));
             let header_workspace = workspace.clone();
             let close_session_workspace = workspace.clone();
             let dragged_session = DraggedSession {
@@ -1231,6 +1331,16 @@ impl Render for SessionsPanel {
                     )
                     .child(
                         ListItem::new(("session-group", workspace.entity_id()))
+                            .toggle(!collapsed)
+                            .on_toggle(cx.listener(move |_this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                let collapsed =
+                                    &mut cx.default_global::<SharedSessionState>().collapsed;
+                                if !collapsed.remove(&session_id) {
+                                    collapsed.insert(session_id);
+                                }
+                                cx.notify();
+                            }))
                             .child(header)
                             .end_slot_on_hover(
                                 IconButton::new(
@@ -1264,6 +1374,9 @@ impl Render for SessionsPanel {
                             ),
                     ),
             );
+            if collapsed {
+                continue;
+            }
             for terminal_view in terminals {
                 root = root.child(self.render_session(
                     terminal_view,
@@ -1273,7 +1386,15 @@ impl Render for SessionsPanel {
                 ));
             }
         }
-        root
+        root.children(self.context_menu.as_ref().map(|(menu, position, _)| {
+            deferred(
+                anchored()
+                    .position(*position)
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(menu.clone()),
+            )
+            .with_priority(1)
+        }))
     }
 }
 
