@@ -18,11 +18,19 @@ use crate::status;
 
 const CHANNEL_KEY: &str = "preferredNotifChannel";
 const HOOKS_KEY: &str = "hooks";
-/// Claude Code fires `UserPromptSubmit` when the user submits a prompt (the
-/// turn begins) and `Stop` when the main agent has finished responding.
-const TURN_HOOKS: [(&str, &str); 2] = [
-    ("UserPromptSubmit", status::TURN_START_MARKER),
-    ("Stop", status::TURN_END_MARKER),
+/// The events that bracket an agent's work, and the marker each one sends.
+///
+/// The same set Warp's own Claude Code plugin listens to. `UserPromptSubmit`
+/// alone is not enough: approving a permission mid-turn submits no prompt, so
+/// without `PostToolUse` the session would sit there looking idle while the
+/// agent worked. The matcher narrows `Notification`, which also fires for
+/// things that are not a request for the user.
+const TURN_HOOKS: [(&str, Option<&str>, &str); 5] = [
+    ("UserPromptSubmit", None, status::TURN_START_MARKER),
+    ("PostToolUse", None, status::TURN_START_MARKER),
+    ("Stop", None, status::TURN_END_MARKER),
+    ("Notification", Some("idle_prompt"), status::TURN_END_MARKER),
+    ("PermissionRequest", None, status::TURN_END_MARKER),
 ];
 /// Notify *and* ring: the bell is what agents other than Claude use, and Hive
 /// falls back to it when a session has never sent an OSC notification.
@@ -109,7 +117,7 @@ fn add_turn_hooks(settings: &mut Map<String, Value>) {
         return; // not a shape Hive understands; leave it be
     };
 
-    for (event, marker) in TURN_HOOKS {
+    for (event, matcher, marker) in TURN_HOOKS {
         let entries = hooks
             .entry(event)
             .or_insert_with(|| Value::Array(Vec::new()));
@@ -119,9 +127,13 @@ fn add_turn_hooks(settings: &mut Map<String, Value>) {
         // Drop Hive's own older markers rather than stacking a new one beside
         // them — the command has changed once already and will again.
         entries.retain(|entry| !mentions(entry, marker));
-        entries.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "hooks": [{ "type": "command", "command": marker_command(marker) }]
-        }));
+        });
+        if let Some(matcher) = matcher {
+            entry["matcher"] = Value::from(matcher);
+        }
+        entries.push(entry);
     }
 }
 
@@ -130,7 +142,7 @@ fn turn_hooks_current(settings: &Map<String, Value>) -> bool {
     let Some(hooks) = settings.get(HOOKS_KEY).and_then(Value::as_object) else {
         return false;
     };
-    TURN_HOOKS.iter().all(|(event, marker)| {
+    TURN_HOOKS.iter().all(|(event, _matcher, marker)| {
         let command = marker_command(marker);
         hooks
             .get(*event)
@@ -160,20 +172,29 @@ fn hook_commands(entry: &Value) -> impl Iterator<Item = &str> {
         .filter_map(|hook| hook.get("command").and_then(Value::as_str))
 }
 
-/// Writes the marker to the terminal the agent is attached to.
+/// Gets the marker to the terminal, by whichever of the two routes works.
 ///
 /// Not `/dev/tty`: Claude Code runs hooks without a controlling terminal, so
-/// opening it fails with ENXIO and the marker goes nowhere. The agent process
-/// itself still owns the pty, and a hook may write to it, so the command walks
-/// up the ancestors until it finds one with a tty. Failing must never fail the
-/// turn, hence the swallowed errors and the trailing `true`.
+/// opening it fails with ENXIO. Two ways around that, the same pair Warp's own
+/// plugin uses:
+///
+/// - the agent process still owns the pty, and a hook may write to it, so the
+///   command walks up its ancestors looking for one with a tty;
+/// - failing that, Claude Code 2.1.141 and later emit a `terminalSequence`
+///   field from a hook's JSON output for exactly this reason.
+///
+/// Order matters: older Claude Code rejects the unknown field ("JSON
+/// validation failed"), so the JSON is only printed when the write didn't
+/// happen. A marker that can't be delivered must never fail the turn either,
+/// hence the swallowed errors and the trailing `true`.
 fn marker_command(marker: &str) -> String {
     format!(
         "p=$PPID; for _ in 1 2 3; do \
 t=$(ps -o tty= -p $p 2>/dev/null | tr -d ' '); \
 case \"$t\" in ''|'??') p=$(ps -o ppid= -p $p 2>/dev/null | tr -d ' ');; \
-*) printf '\\033]9;{marker}\\007' > \"/dev/$t\" 2>/dev/null; break;; esac; \
-[ -n \"$p\" ] || break; done; true"
+*) printf '\\033]9;{marker}\\007' > \"/dev/$t\" 2>/dev/null && exit 0;; esac; \
+[ -n \"$p\" ] || break; done; \
+printf '%s' '{{\"terminalSequence\":\"\\u001b]9;{marker}\\u0007\"}}'; true"
     )
 }
 
@@ -200,7 +221,7 @@ mod tests {
             assert_eq!(settings.len(), 2, "from {empty:?}");
             assert_eq!(settings[CHANNEL_KEY], CHANNEL_VALUE);
             let hooks = settings[HOOKS_KEY].as_object().unwrap();
-            assert_eq!(hooks.len(), 2, "from {empty:?}");
+            assert_eq!(hooks.len(), TURN_HOOKS.len(), "from {empty:?}");
         }
     }
 
@@ -256,14 +277,46 @@ mod tests {
     }
 
     #[test]
-    fn the_marker_command_targets_the_agents_own_tty() {
+    fn the_marker_command_has_both_delivery_routes() {
         let command = marker_command(status::TURN_START_MARKER);
         // Claude Code runs hooks without a controlling terminal: /dev/tty is
-        // ENXIO there, so the command has to find the tty of an ancestor.
+        // ENXIO there, so the command finds the tty of an ancestor...
         assert!(!command.contains("> /dev/tty "));
         assert!(command.contains("ps -o tty="));
         assert!(command.contains(r#"> "/dev/$t""#));
         assert!(command.contains(r"\033]9;hive:turn-start\007"));
+        // ...and only prints the JSON when that didn't happen, since older
+        // Claude Code rejects the field.
+        assert!(command.contains("&& exit 0"));
+        assert!(command.contains("terminalSequence"));
+    }
+
+    #[test]
+    fn the_json_route_is_valid_json_with_escaped_controls() {
+        let command = marker_command(status::TURN_END_MARKER);
+        let json = command
+            .split_once("printf '%s' '")
+            .unwrap()
+            .1
+            .split_once('\'')
+            .unwrap()
+            .0;
+        let parsed: Value = serde_json::from_str(json).expect("hook must print valid JSON");
+        assert_eq!(
+            parsed["terminalSequence"],
+            format!("\u{1b}]9;{}\u{7}", status::TURN_END_MARKER)
+        );
+    }
+
+    #[test]
+    fn the_notification_hook_is_narrowed_to_idle_prompts() {
+        let settings = written(None);
+        let notification = &settings[HOOKS_KEY]["Notification"].as_array().unwrap()[0];
+        assert_eq!(notification["matcher"], "idle_prompt");
+        // Everything else Hive writes stays unmatched.
+        assert!(settings[HOOKS_KEY]["Stop"].as_array().unwrap()[0]
+            .get("matcher")
+            .is_none());
     }
 
     #[test]
