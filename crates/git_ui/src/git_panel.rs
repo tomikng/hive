@@ -79,7 +79,7 @@ use smallvec::SmallVec;
 use std::cell::Cell;
 use std::future::Future;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{sync::Arc, time::Duration, usize};
 use strum::{IntoEnumIterator, VariantNames};
@@ -197,11 +197,33 @@ enum TrashCancel {
 /// can therefore outlive its file, and asking the OS to trash a path that no
 /// longer exists is an error we'd rather not show the user.
 async fn trash_unscanned_path(fs: &Arc<dyn fs::Fs>, abs_path: &Path) -> anyhow::Result<()> {
-    if fs.metadata(abs_path).await?.is_none() {
-        return Ok(());
+    // Asking first would leave a window for the file to go away before the
+    // trash call, so the state that matters is checked after the failure: a
+    // path that isn't there anymore needed no trashing.
+    if let Err(error) = fs.trash(abs_path, Default::default()).await
+        && fs.metadata(abs_path).await?.is_some()
+    {
+        return Err(error);
     }
-    fs.trash(abs_path, Default::default()).await?;
     Ok(())
+}
+
+/// hive: trashes every unscanned path, carrying on past a failure — one file
+/// that won't trash mustn't strand the rest, and the rows of the files that
+/// did go still need refreshing. Returns those paths and the first failure.
+async fn trash_unscanned_paths(
+    fs: &Arc<dyn fs::Fs>,
+    paths: Vec<(RepoPath, PathBuf)>,
+) -> (Vec<RepoPath>, Option<anyhow::Error>) {
+    let mut trashed = Vec::with_capacity(paths.len());
+    let mut failure = None;
+    for (repo_path, abs_path) in paths {
+        match trash_unscanned_path(fs, &abs_path).await {
+            Ok(()) => trashed.push(repo_path),
+            Err(error) => failure = failure.or(Some(error)),
+        }
+    }
+    (trashed, failure)
 }
 
 #[derive(Clone, Copy)]
@@ -2413,28 +2435,31 @@ impl GitPanel {
             // The old `filter_map` dropped them silently and reported
             // success while leaving the files on disk — fall back to
             // trashing by absolute path.
-            let (tasks, fallbacks) = workspace.update(cx, |workspace, cx| {
+            let (tasks, fallbacks, unresolved) = workspace.update(cx, |workspace, cx| {
                 let mut tasks = Vec::new();
                 let mut fallbacks = Vec::new();
+                let mut unresolved = Vec::new();
                 for entry in to_delete.iter() {
                     workspace.project().update(cx, |project, cx| {
                         let Some(project_path) = active_repo
                             .read(cx)
                             .repo_path_to_project_path(&entry.repo_path, cx)
                         else {
+                            unresolved.push(entry.repo_path.clone());
                             return;
                         };
                         match project.trash_file(project_path.clone(), cx) {
                             Some(task) => tasks.push(task),
-                            None => fallbacks.extend(
-                                project
-                                    .absolute_path(&project_path, cx)
-                                    .map(|abs_path| (entry.repo_path.clone(), abs_path)),
-                            ),
+                            None => match project.absolute_path(&project_path, cx) {
+                                Some(abs_path) => {
+                                    fallbacks.push((entry.repo_path.clone(), abs_path))
+                                }
+                                None => unresolved.push(entry.repo_path.clone()),
+                            },
                         }
                     });
                 }
-                (tasks, fallbacks)
+                (tasks, fallbacks, unresolved)
             })?;
             let to_unstage = to_delete
                 .into_iter()
@@ -2446,18 +2471,27 @@ impl GitPanel {
             }
             if !fallbacks.is_empty() {
                 let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx))?;
-                let mut trashed_repo_paths = Vec::with_capacity(fallbacks.len());
-                for (repo_path, abs_path) in fallbacks {
-                    trash_unscanned_path(&fs, &abs_path).await?;
-                    trashed_repo_paths.push(repo_path);
+                let (trashed_repo_paths, failure) = trash_unscanned_paths(&fs, fallbacks).await;
+                if !trashed_repo_paths.is_empty() {
+                    workspace.update(cx, |workspace, cx| {
+                        let git_store = workspace.project().read(cx).git_store().clone();
+                        git_store.update(cx, |git_store, cx| {
+                            git_store.refresh_status_for_paths(&active_repo, trashed_repo_paths, cx);
+                        })
+                    })?;
                 }
-                workspace.update(cx, |workspace, cx| {
-                    let git_store = workspace.project().read(cx).git_store().clone();
-                    git_store.update(cx, |git_store, cx| {
-                        git_store.refresh_status_for_paths(&active_repo, trashed_repo_paths, cx);
-                    })
-                })?;
+                if let Some(error) = failure {
+                    return Err(error);
+                }
             }
+            anyhow::ensure!(
+                unresolved.is_empty(),
+                "could not resolve a path to trash for {}",
+                unresolved
+                    .iter()
+                    .map(|repo_path| repo_path.as_ref().as_unix_str())
+                    .join(", ")
+            );
             Ok(())
         })
         .detach_and_prompt_err("Failed to trash files", window, cx, |e, _, _| {
@@ -9404,6 +9438,47 @@ mod tests {
         assert!(!fs.is_file(abs_path).await);
 
         trash_unscanned_path(&fs, abs_path).await.unwrap();
+    }
+
+    #[gpui::test]
+    async fn test_trash_unscanned_paths_continues_past_a_failure(cx: &mut TestAppContext) {
+        let fake_fs = FakeFs::new(cx.background_executor.clone());
+        fake_fs
+            .insert_tree(
+                path!("/project"),
+                json!({
+                    "dir": { "kept.txt": "" },
+                    ".DS_Store": "",
+                }),
+            )
+            .await;
+        let fs: Arc<dyn fs::Fs> = fake_fs.clone();
+
+        // A non-empty directory can't be trashed non-recursively, so it stands
+        // in for any path the OS refuses.
+        let (trashed, failure) = trash_unscanned_paths(
+            &fs,
+            vec![
+                (
+                    repo_path("dir"),
+                    PathBuf::from(path!("/project/dir")),
+                ),
+                (
+                    repo_path(".DS_Store"),
+                    PathBuf::from(path!("/project/.DS_Store")),
+                ),
+                (
+                    repo_path("gone"),
+                    PathBuf::from(path!("/project/gone")),
+                ),
+            ],
+        )
+        .await;
+
+        assert!(failure.is_some());
+        assert_eq!(trashed, vec![repo_path(".DS_Store"), repo_path("gone")]);
+        assert!(!fs.is_file(Path::new(path!("/project/.DS_Store"))).await);
+        assert!(fs.is_file(Path::new(path!("/project/dir/kept.txt"))).await);
     }
 
     #[gpui::test]
