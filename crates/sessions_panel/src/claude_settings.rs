@@ -14,7 +14,14 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use serde_json::{Map, Value};
 
+use crate::status;
+
 const CHANNEL_KEY: &str = "preferredNotifChannel";
+const HOOKS_KEY: &str = "hooks";
+/// Claude Code fires this when the user submits a prompt: the turn begins.
+const TURN_START_EVENT: &str = "UserPromptSubmit";
+/// ...and this when the main agent has finished responding: the turn ends.
+const TURN_END_EVENT: &str = "Stop";
 /// Notify *and* ring: the bell is what agents other than Claude use, and Hive
 /// falls back to it when a session has never sent an OSC notification.
 const CHANNEL_VALUE: &str = "iterm2_with_bell";
@@ -72,9 +79,60 @@ fn with_channel(text: Option<&str>) -> Result<String> {
         None => Map::new(),
     };
     settings.insert(CHANNEL_KEY.to_string(), Value::from(CHANNEL_VALUE));
+    add_turn_hooks(&mut settings);
     let mut json = serde_json::to_string_pretty(&Value::Object(settings))?;
     json.push('\n');
     Ok(json)
+}
+
+/// Adds the two hooks that bracket a turn, leaving every other hook alone.
+///
+/// The marker goes to `/dev/tty` rather than stdout: Claude Code reads a
+/// hook's stdout itself (`UserPromptSubmit` output is fed back as context), so
+/// anything printed there never reaches the terminal Hive is watching.
+fn add_turn_hooks(settings: &mut Map<String, Value>) {
+    let hooks = settings
+        .entry(HOOKS_KEY)
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Some(hooks) = hooks.as_object_mut() else {
+        return; // not a shape Hive understands; leave it be
+    };
+
+    for (event, marker) in [
+        (TURN_START_EVENT, status::TURN_START_MARKER),
+        (TURN_END_EVENT, status::TURN_END_MARKER),
+    ] {
+        let command = marker_command(marker);
+        let entries = hooks
+            .entry(event)
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Some(entries) = entries.as_array_mut() else {
+            continue;
+        };
+        // Compare the command itself, not the serialised entry: the marker is
+        // full of backslashes, which JSON escapes and a string match wouldn't.
+        let installed = entries.iter().any(|entry| {
+            entry
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|hooks| {
+                    hooks.iter().any(|hook| {
+                        hook.get("command").and_then(Value::as_str) == Some(command.as_str())
+                    })
+                })
+        });
+        if installed {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "hooks": [{ "type": "command", "command": command }]
+        }));
+    }
+}
+
+/// Writing the marker must never fail a turn, hence the redirect and `|| true`.
+fn marker_command(marker: &str) -> String {
+    format!("printf '\\033]9;{marker}\\007' > /dev/tty 2>/dev/null || true")
 }
 
 #[cfg(test)]
@@ -94,12 +152,54 @@ mod tests {
     }
 
     #[test]
-    fn merging_into_nothing_writes_only_the_channel() {
+    fn merging_into_nothing_writes_the_channel_and_the_turn_hooks() {
         for empty in [None, Some(""), Some("   \n")] {
             let settings = written(empty);
-            assert_eq!(settings.len(), 1, "from {empty:?}");
+            assert_eq!(settings.len(), 2, "from {empty:?}");
             assert_eq!(settings[CHANNEL_KEY], CHANNEL_VALUE);
+            let hooks = settings[HOOKS_KEY].as_object().unwrap();
+            assert_eq!(hooks.len(), 2, "from {empty:?}");
         }
+    }
+
+    #[test]
+    fn turn_hooks_are_installed_once_and_keep_existing_hooks() {
+        let existing = r#"{
+            "hooks": {
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "mine.sh"}]}],
+                "SessionStart": [{"hooks": [{"type": "command", "command": "theirs.sh"}]}]
+            }
+        }"#;
+        let settings = written(Some(existing));
+        let hooks = settings[HOOKS_KEY].as_object().unwrap();
+
+        // The user's own hooks survive, on the events Hive also writes to.
+        assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1);
+        let submit = hooks[TURN_START_EVENT].as_array().unwrap();
+        assert_eq!(submit.len(), 2);
+        assert!(submit[0].to_string().contains("mine.sh"));
+        assert!(submit[1].to_string().contains(status::TURN_START_MARKER));
+        assert!(
+            hooks[TURN_END_EVENT].as_array().unwrap()[0]
+                .to_string()
+                .contains(status::TURN_END_MARKER)
+        );
+
+        // Writing again adds nothing.
+        let twice = written(Some(&serde_json::to_string(&settings).unwrap()));
+        assert_eq!(
+            twice[HOOKS_KEY][TURN_START_EVENT].as_array().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn the_marker_command_writes_to_the_tty() {
+        let command = marker_command(status::TURN_START_MARKER);
+        // Claude Code reads a hook's stdout itself, so the marker has to go
+        // straight to the terminal or Hive never sees it.
+        assert!(command.contains("> /dev/tty"));
+        assert!(command.contains(r"\033]9;hive:turn-start\007"));
     }
 
     #[test]

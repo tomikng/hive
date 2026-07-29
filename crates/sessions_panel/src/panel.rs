@@ -426,6 +426,25 @@ impl SessionsPanel {
             .read(cx)
             .foreground_process_command_name();
 
+        // Turn markers move the indicator and nothing else: the agent's own
+        // notification is what tells the user, and a marker on every turn
+        // would double it.
+        if let Some(marker) = message.as_deref().and_then(crate::status::turn_marker) {
+            let Some(tracker) = self.trackers.get_mut(&terminal_id) else {
+                return;
+            };
+            match marker {
+                crate::status::TurnMarker::Started => tracker.signal_turn_started(),
+                crate::status::TurnMarker::Ended => tracker.signal_turn_ended(),
+            }
+            let status = tracker.status().clone();
+            cx.default_global::<SharedSessionState>()
+                .statuses
+                .insert(terminal_id, status);
+            cx.notify();
+            return;
+        }
+
         let message = match message {
             Some(message) => {
                 // This session speaks OSC, so its bell stops counting: Claude
@@ -499,7 +518,11 @@ impl SessionsPanel {
                 let id = NotificationId::composite::<Self>("claude-notifications");
                 toast_target.update(cx, |workspace, cx| {
                     workspace.show_toast(
-                        Toast::new(id, "Claude Code can't tell Hive when it needs you.").on_click(
+                        Toast::new(
+                            id,
+                            "Claude Code can't tell Hive when it's working or when it needs you.",
+                        )
+                        .on_click(
                             "Enable",
                             |_window, cx| {
                                 cx.background_executor()
@@ -824,12 +847,17 @@ impl SessionsPanel {
             })
             .unwrap_or((SessionStatus::Idle, false));
         let indicator = match &status {
-            // A running agent gets a spinner; plain commands keep the dot.
+            // Only a turn in flight spins. An agent whose TUI is merely open
+            // is waiting on you, and used to spin forever.
+            SessionStatus::Working { .. } => Icon::new(IconName::ArrowCircle)
+                .size(IconSize::XSmall)
+                .color(Color::Accent)
+                .with_keyed_rotate_animation(("session-spinner", terminal_id), 2)
+                .into_any_element(),
             SessionStatus::Running { command, .. } if is_agent(command) => {
-                Icon::new(IconName::ArrowCircle)
+                Icon::new(IconName::Check)
                     .size(IconSize::XSmall)
-                    .color(Color::Accent)
-                    .with_keyed_rotate_animation(("session-spinner", terminal_id), 2)
+                    .color(Color::Success)
                     .into_any_element()
             }
             SessionStatus::Running { .. } => {

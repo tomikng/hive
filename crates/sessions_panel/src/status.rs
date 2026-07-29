@@ -17,6 +17,27 @@ pub fn is_claude_code(name: &str) -> bool {
     base_name(name) == "claude"
 }
 
+/// What an agent writes to its terminal to say a turn began or ended. Hive
+/// installs the hooks that emit these (see `claude_settings`); they arrive on
+/// the same OSC channel as notifications, so they are recognised by body.
+pub const TURN_START_MARKER: &str = "hive:turn-start";
+pub const TURN_END_MARKER: &str = "hive:turn-end";
+
+/// The turn marker in an OSC notification body, if that's what it is.
+pub fn turn_marker(message: &str) -> Option<TurnMarker> {
+    match message.trim() {
+        TURN_START_MARKER => Some(TurnMarker::Started),
+        TURN_END_MARKER => Some(TurnMarker::Ended),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnMarker {
+    Started,
+    Ended,
+}
+
 /// The command itself, without its path or a login shell's leading dash.
 fn base_name(name: &str) -> &str {
     name.rsplit('/')
@@ -29,6 +50,14 @@ fn base_name(name: &str) -> &str {
 pub enum SessionStatus {
     Idle,
     Running {
+        command: String,
+        since: Instant,
+    },
+    /// The agent is mid-turn. An agent's process is in the foreground for as
+    /// long as its TUI is open, so [`SessionStatus::Running`] says nothing
+    /// about whether it is doing anything — only a turn marker does. Set by
+    /// [`StatusTracker::signal_turn_started`].
+    Working {
         command: String,
         since: Instant,
     },
@@ -77,6 +106,7 @@ impl StatusTracker {
                 None
             }
             (SessionStatus::Running { command, since }, None)
+            | (SessionStatus::Working { command, since }, None)
             | (SessionStatus::NeedsInput { command, since }, None) => {
                 let finished = CommandFinished {
                     command,
@@ -85,14 +115,20 @@ impl StatusTracker {
                 self.status = SessionStatus::Idle;
                 Some(finished)
             }
-            // A waiting agent keeps waiting. Polling the process table is no
-            // evidence it stopped: only exiting, or the user looking at the
-            // session ([`acknowledge`]), clears this.
+            // A waiting or working agent keeps its state. Polling the process
+            // table is no evidence either way: the agent's process sits in the
+            // foreground the whole time. Only exiting, a turn marker, or the
+            // user looking at the session ([`acknowledge`]) moves it.
             (SessionStatus::NeedsInput { command, since }, Some(cmd)) if command == cmd => {
                 self.status = SessionStatus::NeedsInput { command, since };
                 None
             }
+            (SessionStatus::Working { command, since }, Some(cmd)) if command == cmd => {
+                self.status = SessionStatus::Working { command, since };
+                None
+            }
             (SessionStatus::Running { since, .. }, Some(cmd))
+            | (SessionStatus::Working { since, .. }, Some(cmd))
             | (SessionStatus::NeedsInput { since, .. }, Some(cmd)) => {
                 // ponytail: pipeline/subcommand handoff keeps the original start time
                 self.status = SessionStatus::Running {
@@ -108,7 +144,31 @@ impl StatusTracker {
     /// The program said it wants the user. The only route into
     /// [`SessionStatus::NeedsInput`].
     pub fn signal_needs_input(&mut self) {
-        if let SessionStatus::Running { command, since } = self.status.clone() {
+        match self.status.clone() {
+            SessionStatus::Running { command, since }
+            | SessionStatus::Working { command, since } => {
+                self.status = SessionStatus::NeedsInput { command, since };
+            }
+            SessionStatus::Idle | SessionStatus::NeedsInput { .. } => {}
+        }
+    }
+
+    /// A turn began — the agent has work in hand. The only route into
+    /// [`SessionStatus::Working`].
+    pub fn signal_turn_started(&mut self) {
+        match self.status.clone() {
+            SessionStatus::Running { command, since }
+            | SessionStatus::NeedsInput { command, since } => {
+                self.status = SessionStatus::Working { command, since };
+            }
+            // Already working, or nothing is running to work on.
+            SessionStatus::Working { .. } | SessionStatus::Idle => {}
+        }
+    }
+
+    /// A turn ended — the agent is back to waiting on the user.
+    pub fn signal_turn_ended(&mut self) {
+        if let SessionStatus::Working { command, since } = self.status.clone() {
             self.status = SessionStatus::NeedsInput { command, since };
         }
     }
@@ -153,6 +213,50 @@ mod tests {
         assert_eq!(done.command, "claude");
         assert_eq!(done.duration, Duration::from_secs(90));
         assert_eq!(*t.status(), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn an_open_agent_is_not_working_until_a_turn_starts() {
+        let mut t = StatusTracker::new();
+        let t0 = Instant::now();
+        t.update(Some("claude"), t0);
+        // The TUI being open is not work, however long it stays open.
+        t.update(Some("claude"), t0 + Duration::from_secs(600));
+        assert!(matches!(t.status(), SessionStatus::Running { .. }));
+
+        t.signal_turn_started();
+        assert!(matches!(t.status(), SessionStatus::Working { .. }));
+        // Polling mid-turn must not knock it out of Working.
+        t.update(Some("claude"), t0 + Duration::from_secs(700));
+        assert!(matches!(t.status(), SessionStatus::Working { .. }));
+
+        t.signal_turn_ended();
+        assert!(matches!(t.status(), SessionStatus::NeedsInput { .. }));
+    }
+
+    #[test]
+    fn a_turn_marker_needs_something_running() {
+        let mut t = StatusTracker::new();
+        t.signal_turn_started();
+        assert_eq!(*t.status(), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn quitting_mid_turn_reports_the_command_finished() {
+        let mut t = StatusTracker::new();
+        let t0 = Instant::now();
+        t.update(Some("claude"), t0);
+        t.signal_turn_started();
+        let done = t.update(None, t0 + Duration::from_secs(30)).unwrap();
+        assert_eq!(done.command, "claude");
+        assert_eq!(*t.status(), SessionStatus::Idle);
+    }
+
+    #[test]
+    fn markers_are_recognised_by_body() {
+        assert_eq!(turn_marker("hive:turn-start"), Some(TurnMarker::Started));
+        assert_eq!(turn_marker(" hive:turn-end\n"), Some(TurnMarker::Ended));
+        assert_eq!(turn_marker("claude is waiting for you"), None);
     }
 
     #[test]
