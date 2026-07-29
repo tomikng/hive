@@ -485,21 +485,24 @@ impl SessionsPanel {
             .insert(terminal_id, status);
 
         let window_active = self.window_active(cx);
+        // The badge is for sessions you aren't looking at; being asked for
+        // something is worth saying out loud either way, since watching a
+        // session is not the same as waiting on it.
         if !self.session_focused(&workspace, terminal_id, cx) {
             cx.default_global::<SharedSessionState>()
                 .unseen
                 .insert(terminal_id);
-            let session = terminal_view.read(cx).terminal().read(cx).title(true);
-            self.notify_session_activity(
-                terminal_view,
-                &workspace,
-                window_active,
-                "session-needs-input",
-                message,
-                session,
-                cx,
-            );
         }
+        let session = terminal_view.read(cx).terminal().read(cx).title(true);
+        self.notify_session_activity(
+            terminal_view,
+            &workspace,
+            window_active,
+            "session-needs-input",
+            message,
+            session,
+            cx,
+        );
         cx.notify();
     }
 
