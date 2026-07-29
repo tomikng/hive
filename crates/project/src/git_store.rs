@@ -2056,6 +2056,28 @@ impl GitStore {
         }
     }
 
+    /// hive: recompute git status for paths the worktree scanner never reports.
+    ///
+    /// Anything matching `file_scan_exclusions` (`.DS_Store`, `Thumbs.db`, …)
+    /// is dropped before it becomes a worktree entry event, so the usual
+    /// `WorktreeUpdatedEntries` refresh never fires for it and its git panel
+    /// row outlives the file on disk. Callers that mutate such a path have to
+    /// ask for the refresh themselves.
+    pub fn refresh_status_for_paths(
+        &mut self,
+        repo: &Entity<Repository>,
+        paths: Vec<RepoPath>,
+        cx: &mut Context<Self>,
+    ) {
+        let GitStoreState::Local { downstream, .. } = &self.state else {
+            return;
+        };
+        let downstream = downstream
+            .as_ref()
+            .map(|downstream| downstream.updates_tx.clone());
+        repo.update(cx, |repo, cx| repo.paths_changed(paths, downstream, cx));
+    }
+
     fn on_worktree_store_event(
         &mut self,
         worktree_store: Entity<WorktreeStore>,

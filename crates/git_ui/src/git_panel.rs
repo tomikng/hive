@@ -189,6 +189,21 @@ enum TrashCancel {
     Cancel,
 }
 
+/// hive: trash a path that has no worktree entry, tolerating a file that is
+/// already gone.
+///
+/// Paths matching `file_scan_exclusions` (`.DS_Store` and friends) are never
+/// scanned, so nothing updates their git panel row when they disappear. A row
+/// can therefore outlive its file, and asking the OS to trash a path that no
+/// longer exists is an error we'd rather not show the user.
+async fn trash_unscanned_path(fs: &Arc<dyn fs::Fs>, abs_path: &Path) -> anyhow::Result<()> {
+    if fs.metadata(abs_path).await?.is_none() {
+        return Ok(());
+    }
+    fs.trash(abs_path, Default::default()).await?;
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 struct GitPanelViewOptionsMenuState {
     sort_by: GitPanelSortBy,
@@ -2172,6 +2187,7 @@ impl GitPanel {
             if !entry.status.is_created() {
                 self.perform_checkout(vec![entry.clone()], window, cx);
             } else {
+                let repo_path = entry.repo_path.clone();
                 let prompt = prompt(&format!("Trash {}?", filename), None, window, cx);
                 cx.spawn_in(window, async move |_, cx| {
                     match prompt.await? {
@@ -2201,7 +2217,17 @@ impl GitPanel {
                                 "could not resolve an absolute path for this file",
                             )?;
                             let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx))?;
-                            fs.trash(&abs_path, Default::default()).await?;
+                            trash_unscanned_path(&fs, &abs_path).await?;
+                            workspace.update(cx, |workspace, cx| {
+                                let git_store = workspace.project().read(cx).git_store().clone();
+                                git_store.update(cx, |git_store, cx| {
+                                    git_store.refresh_status_for_paths(
+                                        &active_repo,
+                                        vec![repo_path],
+                                        cx,
+                                    );
+                                })
+                            })?;
                         }
                     }
                     Ok(())
@@ -2210,7 +2236,7 @@ impl GitPanel {
                     "Failed to trash file",
                     window,
                     cx,
-                    |e, _, _| Some(format!("{e}")),
+                    |e, _, _| Some(format!("{e:#}")),
                 );
             }
             Some(())
@@ -2400,7 +2426,11 @@ impl GitPanel {
                         };
                         match project.trash_file(project_path.clone(), cx) {
                             Some(task) => tasks.push(task),
-                            None => fallbacks.extend(project.absolute_path(&project_path, cx)),
+                            None => fallbacks.extend(
+                                project
+                                    .absolute_path(&project_path, cx)
+                                    .map(|abs_path| (entry.repo_path.clone(), abs_path)),
+                            ),
                         }
                     });
                 }
@@ -2416,14 +2446,22 @@ impl GitPanel {
             }
             if !fallbacks.is_empty() {
                 let fs = cx.update(|_, cx| <dyn fs::Fs>::global(cx))?;
-                for abs_path in fallbacks {
-                    fs.trash(&abs_path, Default::default()).await?;
+                let mut trashed_repo_paths = Vec::with_capacity(fallbacks.len());
+                for (repo_path, abs_path) in fallbacks {
+                    trash_unscanned_path(&fs, &abs_path).await?;
+                    trashed_repo_paths.push(repo_path);
                 }
+                workspace.update(cx, |workspace, cx| {
+                    let git_store = workspace.project().read(cx).git_store().clone();
+                    git_store.update(cx, |git_store, cx| {
+                        git_store.refresh_status_for_paths(&active_repo, trashed_repo_paths, cx);
+                    })
+                })?;
             }
             Ok(())
         })
         .detach_and_prompt_err("Failed to trash files", window, cx, |e, _, _| {
-            Some(format!("{e}"))
+            Some(format!("{e:#}"))
         });
     }
 
@@ -9351,6 +9389,21 @@ mod tests {
         cx.run_until_parked();
 
         assert_editor_opened_with_path(&workspace, Path::new("tracked"), &mut cx);
+    }
+
+    #[gpui::test]
+    async fn test_trash_unscanned_path_tolerates_a_missing_file(cx: &mut TestAppContext) {
+        let fake_fs = FakeFs::new(cx.background_executor.clone());
+        fake_fs
+            .insert_tree(path!("/project"), json!({ ".DS_Store": "" }))
+            .await;
+        let fs: Arc<dyn fs::Fs> = fake_fs.clone();
+        let abs_path = Path::new(path!("/project/.DS_Store"));
+
+        trash_unscanned_path(&fs, abs_path).await.unwrap();
+        assert!(!fs.is_file(abs_path).await);
+
+        trash_unscanned_path(&fs, abs_path).await.unwrap();
     }
 
     #[gpui::test]
