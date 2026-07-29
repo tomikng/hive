@@ -4,7 +4,7 @@ edition.workspace = true
 name = "zed"
 # hive: our own versioning, matched to release tags (vX.Y.Z) — the
 # auto-updater compares this against the latest GitHub release tag.
-version = "0.1.4"
+version = "0.1.5"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Zed Team <hi@zed.dev>"]
