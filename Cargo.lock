@@ -16784,6 +16784,7 @@ dependencies = [
  "gpui",
  "log",
  "project",
+ "serde_json",
  "settings",
  "terminal",
  "terminal_view",

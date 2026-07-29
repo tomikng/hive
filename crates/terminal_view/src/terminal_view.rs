@@ -1331,6 +1331,12 @@ fn subscribe_for_terminal_events(
                     cx.emit(Event::Wakeup);
                 }
 
+                // Re-emitted so listeners on the view (the sessions panel) see
+                // it; the terminal itself has nothing to do with it.
+                Event::Notification(message) => {
+                    cx.emit(Event::Notification(message.clone()));
+                }
+
                 Event::BlinkChanged(blinking) => {
                     terminal_view.blinking_terminal_enabled = *blinking;
 

@@ -211,14 +211,15 @@ pub(super) fn spawn_event_loop(
     pty: AlacrittyPty,
     drain_on_exit: bool,
 ) -> Result<PtySender> {
-    // On unix the PTY read stream is teed through `TeePty` so that OSC 133
-    // semantic-prompt sequences (which `vte` otherwise silently drops) are
-    // captured before alacritty's parser consumes the bytes. The bytes are
-    // forwarded to alacritty unchanged, so normal terminal output is unaffected.
+    // On unix the PTY read stream is teed through `TeePty` so that the OSC
+    // sequences `vte` otherwise silently drops — semantic prompts (133) and
+    // agent notifications (9, 777) — are captured before alacritty's parser
+    // consumes the bytes. The bytes are forwarded to alacritty unchanged, so
+    // normal terminal output is unaffected.
     #[cfg(unix)]
     let event_loop = {
         let tee_pty =
-            TeePty::new(pty, events_tx.clone()).context("failed to set up OSC 133 tee for pty")?;
+            TeePty::new(pty, events_tx.clone()).context("failed to set up OSC tee for pty")?;
         EventLoop::new(term, ZedListener(events_tx), tee_pty, drain_on_exit, false)
             .context("failed to create event loop")?
     };
@@ -234,43 +235,70 @@ pub(super) fn spawn_event_loop(
     })
 }
 
-/// The literal bytes that open an OSC 133 semantic-prompt sequence: `ESC ] 133 ;`.
 #[cfg(unix)]
-const OSC133_PREFIX: &[u8] = b"\x1b]133;";
+const ESC: u8 = 0x1b;
+#[cfg(unix)]
+const BEL: u8 = 0x07;
 
-/// Upper bound on the payload we buffer while matching a single OSC 133
-/// sequence. Real payloads are tiny (`A`, `D;130`, ...); anything longer is not
-/// a sequence we recognize, so we abandon the match rather than grow unbounded.
+/// Shell semantic prompts, the command-block marks (`ESC ] 133 ; A ST`).
 #[cfg(unix)]
-const OSC133_MAX_PAYLOAD: usize = 64;
+const OSC_SEMANTIC_PROMPT: u32 = 133;
+/// iTerm2's notification form, `ESC ] 9 ; <body> ST`. This is what Claude Code
+/// emits on its `iterm2` / `iterm2_with_bell` channel, carrying the wording it
+/// wrote for the user ("Claude is waiting for your input").
+#[cfg(unix)]
+const OSC_ITERM2_NOTIFY: u32 = 9;
+/// The ghostty/urxvt notification form, `ESC ] 777 ; notify ; <title> ; <body> ST`.
+/// Same idea as OSC 9 with a title alongside the body.
+///
+/// Kitty's OSC 99 is deliberately not handled: it is a chunked, key/value
+/// encoded protocol, and agents only pick it when the terminal identifies
+/// itself as kitty, which Hive never does.
+#[cfg(unix)]
+const OSC_GHOSTTY_NOTIFY: u32 = 777;
+
+/// Upper bound on the payload we buffer while matching a single sequence.
+/// Semantic-prompt payloads are tiny (`A`, `D;130`); a notification is a
+/// sentence. Anything past this is not a sequence we recognize, so the match
+/// is abandoned rather than allowed to grow unbounded.
+#[cfg(unix)]
+const OSC_MAX_PAYLOAD: usize = 512;
+
+/// Digits accepted in the numeric code, enough for the longest OSC in use
+/// anywhere (`21337`).
+#[cfg(unix)]
+const OSC_MAX_CODE_DIGITS: u8 = 5;
 
 #[cfg(unix)]
-enum Osc133State {
+#[derive(Clone, Copy)]
+enum OscState {
     /// Not inside a candidate sequence.
     Ground,
-    /// Matched `OSC133_PREFIX` up to (but not including) this index.
-    Prefix(usize),
-    /// Past the `133;` prefix, accumulating the payload until the terminator.
-    Payload,
+    /// Saw `ESC`; a following `]` opens an OSC.
+    Escape,
+    /// Accumulating the numeric code, before the first `;`.
+    Code { value: u32, digits: u8 },
+    /// Past `<code>;`, accumulating the payload until the terminator.
+    Payload { code: u32 },
     /// Saw `ESC` inside the payload; a following `\` closes the sequence (ST).
-    PayloadEscape,
+    PayloadEscape { code: u32 },
 }
 
-/// Incremental matcher for OSC 133 A/B/C/D sequences. It scans raw PTY bytes and
-/// only recognizes the exact `ESC ] 133 ; ... (BEL | ESC \)` shape, ignoring all
-/// other bytes. It is deliberately not a general ANSI parser. State persists
+/// Incremental matcher for the OSC sequences `vte` silently drops. It scans raw
+/// PTY bytes for the exact `ESC ] <code> ; ... (BEL | ESC \)` shape and ignores
+/// everything else; it is deliberately not a general ANSI parser. State persists
 /// across calls so a sequence split over multiple read chunks is still matched.
 #[cfg(unix)]
-struct Osc133Matcher {
-    state: Osc133State,
+struct OscMatcher {
+    state: OscState,
     payload: Vec<u8>,
 }
 
 #[cfg(unix)]
-impl Osc133Matcher {
+impl OscMatcher {
     fn new() -> Self {
         Self {
-            state: Osc133State::Ground,
+            state: OscState::Ground,
             payload: Vec::new(),
         }
     }
@@ -278,88 +306,143 @@ impl Osc133Matcher {
     fn scan(&mut self, bytes: &[u8], events_tx: &UnboundedSender<PtyEvent>) {
         for &byte in bytes {
             match self.state {
-                Osc133State::Ground => {
-                    if byte == OSC133_PREFIX[0] {
-                        self.state = Osc133State::Prefix(1);
+                OscState::Ground => {
+                    if byte == ESC {
+                        self.state = OscState::Escape;
                     }
                 }
-                Osc133State::Prefix(index) => {
-                    if index < OSC133_PREFIX.len() && byte == OSC133_PREFIX[index] {
-                        let next = index + 1;
-                        if next == OSC133_PREFIX.len() {
+                OscState::Escape => {
+                    self.state = match byte {
+                        b']' => OscState::Code {
+                            value: 0,
+                            digits: 0,
+                        },
+                        ESC => OscState::Escape,
+                        _ => OscState::Ground,
+                    };
+                }
+                OscState::Code { value, digits } => {
+                    self.state = match byte {
+                        b'0'..=b'9' if digits < OSC_MAX_CODE_DIGITS => OscState::Code {
+                            value: value * 10 + u32::from(byte - b'0'),
+                            digits: digits + 1,
+                        },
+                        b';' if digits > 0 && is_recognized_osc(value) => {
                             self.payload.clear();
-                            self.state = Osc133State::Payload;
-                        } else {
-                            self.state = Osc133State::Prefix(next);
+                            OscState::Payload { code: value }
                         }
-                    } else if byte == OSC133_PREFIX[0] {
-                        self.state = Osc133State::Prefix(1);
-                    } else {
-                        self.state = Osc133State::Ground;
-                    }
+                        ESC => OscState::Escape,
+                        _ => OscState::Ground,
+                    };
                 }
-                Osc133State::Payload => match byte {
-                    0x07 => {
-                        self.finish(events_tx);
-                        self.state = Osc133State::Ground;
+                OscState::Payload { code } => match byte {
+                    BEL => {
+                        self.finish(code, events_tx);
+                        self.state = OscState::Ground;
                     }
-                    0x1b => self.state = Osc133State::PayloadEscape,
+                    ESC => self.state = OscState::PayloadEscape { code },
                     _ => {
-                        if self.payload.len() < OSC133_MAX_PAYLOAD {
+                        if self.payload.len() < OSC_MAX_PAYLOAD {
                             self.payload.push(byte);
                         } else {
-                            self.state = Osc133State::Ground;
+                            self.state = OscState::Ground;
                         }
                     }
                 },
-                Osc133State::PayloadEscape => {
-                    if byte == b'\\' {
-                        self.finish(events_tx);
-                        self.state = Osc133State::Ground;
-                    } else if byte == OSC133_PREFIX[0] {
-                        self.state = Osc133State::Prefix(1);
-                    } else {
-                        self.state = Osc133State::Ground;
-                    }
+                OscState::PayloadEscape { code } => {
+                    self.state = match byte {
+                        b'\\' => {
+                            self.finish(code, events_tx);
+                            OscState::Ground
+                        }
+                        ESC => OscState::Escape,
+                        _ => OscState::Ground,
+                    };
                 }
             }
         }
     }
 
-    fn finish(&self, events_tx: &UnboundedSender<PtyEvent>) {
-        let Some((&kind_byte, rest)) = self.payload.split_first() else {
-            return;
+    fn finish(&self, code: u32, events_tx: &UnboundedSender<PtyEvent>) {
+        let event = match code {
+            OSC_SEMANTIC_PROMPT => semantic_prompt_event(&self.payload),
+            OSC_ITERM2_NOTIFY => iterm2_notification(&self.payload),
+            OSC_GHOSTTY_NOTIFY => ghostty_notification(&self.payload),
+            _ => None,
         };
-        let kind = kind_byte as char;
-        if !matches!(kind, 'A' | 'B' | 'C' | 'D') {
-            return;
+        if let Some(event) = event {
+            events_tx.unbounded_send(PtyEvent::Event(event)).ok();
         }
-        // Only the `D` (command finished) sequence carries an exit code, as
-        // `133;D;<code>`. A bare `D` reports completion with no known code.
-        let exit_code = if kind == 'D' {
-            rest.iter()
-                .position(|&byte| byte == b';')
-                .and_then(|index| rest.get(index + 1..))
-                .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                .and_then(|text| text.trim().parse::<i32>().ok())
-        } else {
-            None
-        };
-        events_tx
-            .unbounded_send(PtyEvent::Event(TerminalBackendEvent::SemanticPrompt {
-                kind,
-                exit_code,
-            }))
-            .ok();
     }
 }
 
+#[cfg(unix)]
+fn is_recognized_osc(code: u32) -> bool {
+    matches!(
+        code,
+        OSC_SEMANTIC_PROMPT | OSC_ITERM2_NOTIFY | OSC_GHOSTTY_NOTIFY
+    )
+}
+
+#[cfg(unix)]
+fn semantic_prompt_event(payload: &[u8]) -> Option<TerminalBackendEvent> {
+    let (&kind_byte, rest) = payload.split_first()?;
+    let kind = kind_byte as char;
+    if !matches!(kind, 'A' | 'B' | 'C' | 'D') {
+        return None;
+    }
+    // Only the `D` (command finished) sequence carries an exit code, as
+    // `133;D;<code>`. A bare `D` reports completion with no known code.
+    let exit_code = if kind == 'D' {
+        rest.iter()
+            .position(|&byte| byte == b';')
+            .and_then(|index| rest.get(index + 1..))
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| text.trim().parse::<i32>().ok())
+    } else {
+        None
+    };
+    Some(TerminalBackendEvent::SemanticPrompt { kind, exit_code })
+}
+
+#[cfg(unix)]
+fn iterm2_notification(payload: &[u8]) -> Option<TerminalBackendEvent> {
+    let message = std::str::from_utf8(payload).ok()?.trim();
+    // `9;4;...` is the ConEmu progress-bar form sharing this OSC code — a
+    // progress report, not a notification.
+    if message.is_empty() || message == "4" || message.starts_with("4;") {
+        return None;
+    }
+    Some(TerminalBackendEvent::Notification(message.to_string()))
+}
+
+#[cfg(unix)]
+fn ghostty_notification(payload: &[u8]) -> Option<TerminalBackendEvent> {
+    // OSC 777 also carries non-notification subcommands (`rgb-color`), so the
+    // `notify` prefix is required.
+    let rest = std::str::from_utf8(payload).ok()?.strip_prefix("notify;")?;
+    // `<title>;<body>`, where the body may itself contain `;`. Only the body is
+    // kept: the title identifies the sending app, which the session row already
+    // says. A notification that carries only a title falls back to it.
+    let message = match rest.split_once(';') {
+        Some((title, "")) => title,
+        Some((_, body)) => body,
+        None => rest,
+    }
+    .trim();
+    if message.is_empty() {
+        return None;
+    }
+    Some(TerminalBackendEvent::Notification(message.to_string()))
+}
+
 /// Reader half of [`TeePty`]: reads from a clone of the PTY master fd and scans
-/// the bytes for OSC 133 before returning them unchanged to the caller.
+/// the bytes for the OSC sequences Hive cares about before returning them
+/// unchanged to the caller.
 #[cfg(unix)]
 pub(super) struct TeeReader {
     file: std::fs::File,
-    matcher: Osc133Matcher,
+    matcher: OscMatcher,
     events_tx: UnboundedSender<PtyEvent>,
 }
 
@@ -375,7 +458,7 @@ impl io::Read for TeeReader {
 }
 
 /// Transparent wrapper around alacritty's [`tty::Pty`] that tees the read stream
-/// through an [`Osc133Matcher`]. All other `EventedPty` behavior (registration,
+/// through an [`OscMatcher`]. All other `EventedPty` behavior (registration,
 /// writing, child events, resize) delegates to the inner PTY unchanged.
 ///
 /// The reader reads from a `try_clone` of the PTY master fd, which shares the
@@ -396,7 +479,7 @@ impl TeePty {
             inner: pty,
             reader: TeeReader {
                 file,
-                matcher: Osc133Matcher::new(),
+                matcher: OscMatcher::new(),
                 events_tx,
             },
         })
@@ -1280,36 +1363,48 @@ mod tests {
 
     use super::*;
 
+    /// Drains everything the matcher emitted for `chunks`, fed one chunk at a
+    /// time so split sequences are exercised.
     #[cfg(unix)]
-    #[test]
-    fn osc133_matcher_captures_semantic_prompts_across_chunks() {
+    fn scan_chunks(chunks: &[&[u8]]) -> Vec<TerminalBackendEvent> {
         use futures::channel::mpsc::unbounded;
 
         let (events_tx, mut events_rx) = unbounded::<PtyEvent>();
-        let mut matcher = Osc133Matcher::new();
-
-        // A, B, C and D-with-exit, all within a single read chunk, surrounded
-        // by ordinary output that must be ignored.
-        matcher.scan(
-            b"prompt\x1b]133;A\x07type\x1b]133;B\x07run\x1b]133;C\x07out\x1b]133;D;0\x07",
-            &events_tx,
-        );
-        // A sequence split across two chunks, terminated by ESC-backslash (ST)
-        // rather than BEL, carrying a non-zero exit code.
-        matcher.scan(b"before\x1b]13", &events_tx);
-        matcher.scan(b"3;D;130\x1b\\after", &events_tx);
-        // A bare D with no exit code.
-        matcher.scan(b"\x1b]133;D\x07", &events_tx);
-
+        let mut matcher = OscMatcher::new();
+        for chunk in chunks {
+            matcher.scan(chunk, &events_tx);
+        }
         drop(events_tx);
 
         let mut captured = Vec::new();
-        while let Ok(event) = events_rx.try_recv() {
-            if let PtyEvent::Event(TerminalBackendEvent::SemanticPrompt { kind, exit_code }) = event
-            {
-                captured.push((kind, exit_code));
-            }
+        while let Ok(PtyEvent::Event(event)) = events_rx.try_recv() {
+            captured.push(event);
         }
+        captured
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc_matcher_captures_semantic_prompts_across_chunks() {
+        let captured = scan_chunks(&[
+            // A, B, C and D-with-exit, all within a single read chunk,
+            // surrounded by ordinary output that must be ignored.
+            b"prompt\x1b]133;A\x07type\x1b]133;B\x07run\x1b]133;C\x07out\x1b]133;D;0\x07",
+            // A sequence split across two chunks, terminated by ESC-backslash
+            // (ST) rather than BEL, carrying a non-zero exit code.
+            b"before\x1b]13",
+            b"3;D;130\x1b\\after",
+            // A bare D with no exit code.
+            b"\x1b]133;D\x07",
+        ]);
+
+        let captured: Vec<_> = captured
+            .into_iter()
+            .map(|event| match event {
+                TerminalBackendEvent::SemanticPrompt { kind, exit_code } => (kind, exit_code),
+                other => panic!("expected SemanticPrompt, got {other:?}"),
+            })
+            .collect();
 
         assert_eq!(
             captured,
@@ -1322,6 +1417,77 @@ mod tests {
                 ('D', None),
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc_matcher_captures_agent_notifications() {
+        let captured = scan_chunks(&[
+            // The exact sequence Claude Code emits at the end of a turn,
+            // captured from a live session.
+            b"\x1b]9;Claude is waiting for your input\x07",
+            // OSC 9 split across chunks and closed with ST instead of BEL.
+            b"working\x1b]9;Claude needs your per",
+            b"mission to use Bash\x1b\\done",
+            // The ghostty form, which carries a title as well.
+            b"\x1b]777;notify;Claude Code;Task finished\x07",
+            // A ghostty body that itself contains a semicolon.
+            b"\x1b]777;notify;Claude Code;ran: a; then b\x07",
+        ]);
+
+        let captured: Vec<_> = captured
+            .into_iter()
+            .map(|event| match event {
+                TerminalBackendEvent::Notification(message) => message,
+                other => panic!("expected Notification, got {other:?}"),
+            })
+            .collect();
+
+        assert_eq!(
+            captured,
+            vec![
+                "Claude is waiting for your input".to_string(),
+                "Claude needs your permission to use Bash".to_string(),
+                "Task finished".to_string(),
+                "ran: a; then b".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc_matcher_ignores_non_notification_sequences() {
+        let captured = scan_chunks(&[
+            // OSC 9;4 is the ConEmu progress-bar form, not a notification:
+            // indeterminate, a percentage, and a clear.
+            b"\x1b]9;4;3;\x07\x1b]9;4;1;40\x07\x1b]9;4;0;\x07",
+            // Codes we don't handle, including ones whose payload could look
+            // like a notification.
+            b"\x1b]0;window title\x07\x1b]99;i=1;kitty notify\x07\x1b]777;rgb-color;1;fff\x07",
+            // Truncated and empty payloads.
+            b"\x1b]9;\x07\x1b]133;\x07\x1b]9;unterminated",
+        ]);
+
+        assert!(captured.is_empty(), "expected nothing, got {captured:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn osc_matcher_abandons_oversized_payloads() {
+        let mut oversized = b"\x1b]9;".to_vec();
+        oversized.extend(std::iter::repeat_n(b'x', OSC_MAX_PAYLOAD + 1));
+        oversized.push(0x07);
+        // A real sequence after the abandoned one is still matched, i.e. the
+        // matcher recovers rather than wedging.
+        oversized.extend_from_slice(b"\x1b]9;after\x07");
+
+        let captured = scan_chunks(&[&oversized]);
+
+        assert_eq!(captured.len(), 1, "got {captured:?}");
+        assert!(matches!(
+            &captured[0],
+            TerminalBackendEvent::Notification(message) if message == "after"
+        ));
     }
 
     #[test]

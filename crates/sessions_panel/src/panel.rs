@@ -17,7 +17,10 @@ use workspace::{
     notifications::NotificationId,
 };
 
-use crate::status::{NEEDS_INPUT_QUIET_THRESHOLD, SessionStatus, StatusTracker, is_agent};
+use util::ResultExt as _;
+
+use crate::claude_settings;
+use crate::status::{SessionStatus, StatusTracker, is_agent, is_claude_code};
 
 actions!(sessions_panel, [ToggleFocus, NewSession]);
 
@@ -38,12 +41,6 @@ pub struct SessionsPanel {
     focus_handle: FocusHandle,
     window_handle: AnyWindowHandle,
     pub(crate) trackers: HashMap<EntityId, StatusTracker>,
-    /// Per-terminal (digest of visible content, when it last changed).
-    /// "Content stopped changing" is the quiet signal. The cursor position
-    /// was used before, but TUI agents (claude) move the cursor constantly
-    /// even while idle — status bar, spinner rows — so quiet never
-    /// registered and needs-input fired late or not at all.
-    activity: HashMap<EntityId, (u64, Instant)>,
     /// Repos this panel attached to the workspace because a terminal cd'd
     /// into them, and when a terminal was last seen inside each. Only these
     /// are ever auto-removed — folders the user opened are never touched.
@@ -54,29 +51,21 @@ pub struct SessionsPanel {
     /// Terminals we've already tried to auto-title, successful or not — one
     /// agent-CLI call per session, ever.
     naming_attempted: HashSet<EntityId>,
-    /// Terminals whose current bell we've already reacted to. `has_bell` is
-    /// sticky until the terminal is focused, so this gives one reaction per
-    /// ring instead of one per poll.
-    belled: HashSet<EntityId>,
-    /// Per-terminal bell subscriptions so a ring re-runs the poll
-    /// immediately — spinner, dot and notification all flip at ring time
-    /// instead of up to one poll interval later.
-    bell_subscriptions: HashMap<EntityId, Subscription>,
-    /// When the window last gained or lost focus. TUI agents ask for focus
-    /// reporting and repaint on the `\x1b[I` / `\x1b[O` the terminal sends
-    /// them, so the visible content changes with no agent activity behind
-    /// it. Counting that repaint restarted the quiet timer: focusing the
-    /// window flipped a waiting session back to a spinner, and leaving it
-    /// re-fired the needs-input notification seconds later.
-    focus_changed_at: Option<Instant>,
+    /// Per-terminal subscriptions to the signals that mean "the program wants
+    /// you": OSC 9 / OSC 777 notifications, and the bell. Attention flips the
+    /// moment the signal arrives rather than up to one poll interval later.
+    signal_subscriptions: HashMap<EntityId, Subscription>,
+    /// Terminals that have emitted an OSC notification. Claude Code's
+    /// `iterm2_with_bell` channel sends the notification AND rings, so once a
+    /// session is known to speak OSC its bell is ignored — the notification
+    /// carries better wording and would otherwise be doubled.
+    osc_capable: HashSet<EntityId>,
+    /// Whether this panel has already offered to turn on Claude Code's
+    /// notification channel. One offer per window, ever; accepting writes the
+    /// setting, after which the check that triggers it stops matching.
+    claude_notify_offered: bool,
     _git_subscription: Subscription,
-    _window_activation_subscription: Subscription,
 }
-
-/// How long after a focus change content changes count as repaint noise
-/// rather than agent output. Must exceed the 2s poll interval so the poll
-/// that first sees the repaint still absorbs it.
-const FOCUS_REPAINT_GRACE: Duration = Duration::from_secs(3);
 
 /// A session row picked up in the rail, carried until it's dropped on another
 /// row.
@@ -175,24 +164,18 @@ impl SessionsPanel {
                         _ => {}
                     },
                 );
-                let window_activation_subscription =
-                    cx.observe_window_activation(window, |this, _window, _cx| {
-                        this.focus_changed_at = Some(Instant::now());
-                    });
                 SessionsPanel {
                     workspace: weak,
                     focus_handle: cx.focus_handle(),
                     window_handle,
                     trackers: HashMap::default(),
-                    activity: HashMap::default(),
                     auto_attached_repos: HashMap::default(),
                     repo_root_cache: HashMap::default(),
                     naming_attempted: HashSet::default(),
-                    belled: HashSet::default(),
-                    bell_subscriptions: HashMap::default(),
-                    focus_changed_at: None,
+                    signal_subscriptions: HashMap::default(),
+                    osc_capable: HashSet::default(),
+                    claude_notify_offered: false,
                     _git_subscription: git_subscription,
-                    _window_activation_subscription: window_activation_subscription,
                 }
             })
         })
@@ -212,6 +195,9 @@ impl SessionsPanel {
     /// `StatusTracker`, and on a command finishing at or above the
     /// threshold, notifies the user: a native notification while the
     /// window is inactive, or an in-app toast while it's active.
+    ///
+    /// Polling answers "what is running", nothing more. "Does this session
+    /// want me" arrives as a signal — see [`Self::on_agent_signal`].
     fn poll_statuses(&mut self, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
@@ -256,9 +242,9 @@ impl SessionsPanel {
             }
         }
         self.trackers.retain(|id, _| live_ids.contains(id));
-        self.activity.retain(|id, _| live_ids.contains(id));
-        self.bell_subscriptions
+        self.signal_subscriptions
             .retain(|id, _| live_ids.contains(id));
+        self.osc_capable.retain(|id| live_ids.contains(id));
 
         let cwds: Vec<PathBuf> = terminals
             .iter()
@@ -273,115 +259,59 @@ impl SessionsPanel {
         self.follow_terminal_repos(&cwds, cx);
 
         for terminal_view in terminals {
-            // A ring re-runs this whole pass immediately, so the spinner,
-            // attention dot and notification flip at ring time instead of up
-            // to one poll interval later.
-            self.bell_subscriptions
-                .entry(terminal_view.entity_id())
+            let terminal_id = terminal_view.entity_id();
+            // Attention is signal-driven: the OSC notification or bell flips
+            // the badge and notifies the moment it arrives, not on the next
+            // poll. This loop only tracks what is actually running.
+            self.signal_subscriptions
+                .entry(terminal_id)
                 .or_insert_with(|| {
                     let terminal = terminal_view.read(cx).terminal().clone();
-                    cx.subscribe(&terminal, |this, _terminal, event, cx| {
-                        if matches!(event, terminal::Event::Bell) {
-                            this.poll_statuses(cx);
+                    let signalled = terminal_view.downgrade();
+                    cx.subscribe(&terminal, move |this, _terminal, event, cx| {
+                        let Some(terminal_view) = signalled.upgrade() else {
+                            return;
+                        };
+                        match event {
+                            terminal::Event::Notification(message) => {
+                                this.on_agent_signal(&terminal_view, Some(message.clone()), cx);
+                            }
+                            terminal::Event::Bell => {
+                                this.on_agent_signal(&terminal_view, None, cx);
+                            }
+                            _ => {}
                         }
                     })
                 });
 
-            let terminal = terminal_view.read(cx).terminal().read(cx);
-            let foreground = terminal.foreground_process_command_name();
-            let content_digest = {
-                use std::hash::{Hash as _, Hasher as _};
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                terminal.last_n_non_empty_lines(40).hash(&mut hasher);
-                hasher.finish()
-            };
+            let foreground = terminal_view
+                .read(cx)
+                .terminal()
+                .read(cx)
+                .foreground_process_command_name();
 
-            let focus_repaint = self
-                .focus_changed_at
-                .is_some_and(|at| now.saturating_duration_since(at) < FOCUS_REPAINT_GRACE);
-            let last_activity = self
-                .activity
-                .entry(terminal_view.entity_id())
-                .or_insert((content_digest, now));
-            if last_activity.0 != content_digest {
-                // Take the new digest either way, so a repaint isn't
-                // re-detected as activity once the grace window closes; only
-                // restart the quiet timer when it wasn't focus-driven.
-                last_activity.0 = content_digest;
-                if !focus_repaint {
-                    last_activity.1 = now;
-                }
-            }
-            let quiet_for = now.saturating_duration_since(last_activity.1);
-            let agent = foreground.as_deref().is_some_and(is_agent);
-
-            // The terminal bell is the deterministic done/needs-attention
-            // signal (Claude Code and friends ring it; Warp relies on the
-            // same convention) — treat a ring as instantly quiet so the
-            // status flips without waiting out the heuristic, and react once
-            // per ring (`has_bell` stays set until the terminal is focused).
-            let bell = terminal_view.read(cx).has_bell();
-            let bell_edge = bell && self.belled.insert(terminal_view.entity_id());
-            if !bell {
-                self.belled.remove(&terminal_view.entity_id());
-            }
-            let quiet_for = if bell {
-                quiet_for.max(NEEDS_INPUT_QUIET_THRESHOLD)
-            } else {
-                quiet_for
-            };
-
-            let terminal_id = terminal_view.entity_id();
             let focused =
                 window_active && workspace_is_active && active_item_id == Some(terminal_id);
-            let previous_status = cx
-                .default_global::<SharedSessionState>()
-                .statuses
-                .get(&terminal_id)
-                .cloned();
 
             let tracker = self
                 .trackers
                 .entry(terminal_id)
                 .or_insert_with(StatusTracker::new);
-            let finished_command = tracker.update(foreground.as_deref(), quiet_for, agent, now);
-            let new_status = tracker.status().clone();
-
-            // Warp-style attention: a long-running agent that just went quiet
-            // is done or waiting on the user. Mark the session unseen and
-            // notify — agents like claude never *exit*, so the
-            // command-finished path below can't cover them.
-            if let (
-                Some(SessionStatus::Running { command, since }),
-                SessionStatus::NeedsInput { .. },
-            ) = (&previous_status, &new_status)
-            {
-                if is_agent(command)
-                    && (bell_edge
-                        || now.saturating_duration_since(*since) >= Self::agent_notify_threshold())
-                {
-                    if !focused {
-                        cx.default_global::<SharedSessionState>()
-                            .unseen
-                            .insert(terminal_id);
-                        let title = terminal_view.read(cx).terminal().read(cx).title(true);
-                        self.notify_session_activity(
-                            &terminal_view,
-                            &workspace,
-                            window_active,
-                            "session-needs-input",
-                            format!("{command} is waiting for you"),
-                            title,
-                            cx,
-                        );
-                    }
-                }
+            let finished_command = tracker.update(foreground.as_deref(), now);
+            if focused {
+                // Looking at a session answers it.
+                tracker.acknowledge();
             }
+            let new_status = tracker.status().clone();
 
             if focused {
                 cx.default_global::<SharedSessionState>()
                     .unseen
                     .remove(&terminal_id);
+            }
+
+            if foreground.as_deref().is_some_and(is_claude_code) {
+                self.offer_claude_notifications(cx);
             }
 
             // Auto-title agent sessions: once the agent has run long enough
@@ -465,16 +395,167 @@ impl SessionsPanel {
         std::env::var("HIVE_NO_AUTO_REPO").is_err()
     }
 
-    /// Minimum time an agent must have been working before its going-quiet
-    /// notifies. Much lower than `notify_threshold` — a 10-second claude
-    /// answer completing while you look elsewhere is exactly what you want
-    /// pinged about, whereas 10-second shell commands are noise.
-    fn agent_notify_threshold() -> Duration {
-        std::env::var("HIVE_AGENT_NOTIFY_SECS")
-            .ok()
-            .and_then(|secs| secs.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::from_secs(5))
+    /// A program in `terminal_view` said it wants the user. `message` is the
+    /// wording it sent over OSC 9 / OSC 777; `None` means it only rang the
+    /// bell.
+    ///
+    /// This is the ONLY route to `NeedsInput`. Hive used to infer it from a
+    /// terminal whose visible content had not changed for four seconds, which
+    /// reported every long think, tool call and slow build as "waiting for
+    /// you". Silence is not a signal — being told is.
+    fn on_agent_signal(
+        &mut self,
+        terminal_view: &Entity<TerminalView>,
+        message: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let terminal_id = terminal_view.entity_id();
+        let foreground = terminal_view
+            .read(cx)
+            .terminal()
+            .read(cx)
+            .foreground_process_command_name();
+
+        let message = match message {
+            Some(message) => {
+                // This session speaks OSC, so its bell stops counting: Claude
+                // Code's `iterm2_with_bell` channel sends both, and the
+                // notification carries the better wording.
+                self.osc_capable.insert(terminal_id);
+                message
+            }
+            None => {
+                if self.osc_capable.contains(&terminal_id) {
+                    return;
+                }
+                // A bell only means "your turn" from a known agent — shells
+                // ring it for tab-completion misses and every stray key.
+                let Some(command) = foreground.as_deref().filter(|name| is_agent(name)) else {
+                    return;
+                };
+                format!("{command} is waiting for you")
+            }
+        };
+
+        let Some(tracker) = self.trackers.get_mut(&terminal_id) else {
+            return; // first poll hasn't seen this terminal yet
+        };
+        tracker.signal_needs_input();
+        let status = tracker.status().clone();
+        cx.default_global::<SharedSessionState>()
+            .statuses
+            .insert(terminal_id, status);
+
+        let window_active = self.window_active(cx);
+        if !self.session_focused(&workspace, terminal_id, cx) {
+            cx.default_global::<SharedSessionState>()
+                .unseen
+                .insert(terminal_id);
+            let session = terminal_view.read(cx).terminal().read(cx).title(true);
+            self.notify_session_activity(
+                terminal_view,
+                &workspace,
+                window_active,
+                "session-needs-input",
+                message,
+                session,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    /// Claude Code stays silent in Hive until its notification channel is set
+    /// (see [`crate::claude_settings`]), so the first time an agent runs, offer
+    /// to switch it on. Once per window, and never when the user has already
+    /// chosen a channel.
+    fn offer_claude_notifications(&mut self, cx: &mut Context<Self>) {
+        if self.claude_notify_offered {
+            return;
+        }
+        self.claude_notify_offered = true;
+        cx.spawn(async move |this, cx| {
+            let configured = cx
+                .background_executor()
+                .spawn(async { claude_settings::notifications_already_configured() })
+                .await;
+            if configured {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                let Some(toast_target) = this.active_workspace(cx) else {
+                    return;
+                };
+                let id = NotificationId::composite::<Self>("claude-notifications");
+                toast_target.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        Toast::new(id, "Claude Code can't tell Hive when it needs you.").on_click(
+                            "Enable",
+                            |_window, cx| {
+                                cx.background_executor()
+                                    .spawn(async {
+                                        claude_settings::enable_notifications().log_err();
+                                    })
+                                    .detach();
+                            },
+                        ),
+                        cx,
+                    );
+                });
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The workspace whose tab strip is on screen. Toasts render per-workspace,
+    /// so one shown on a background session is invisible until the user
+    /// happens to switch there.
+    fn active_workspace(&self, cx: &App) -> Option<Entity<Workspace>> {
+        let workspace = self.workspace.upgrade()?;
+        Some(
+            workspace
+                .read(cx)
+                .multi_workspace()
+                .and_then(|multi_workspace| multi_workspace.upgrade())
+                .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+                .unwrap_or(workspace),
+        )
+    }
+
+    fn window_active(&self, cx: &mut Context<Self>) -> bool {
+        self.window_handle
+            .update(cx, |_, window, _| window.is_window_active())
+            .unwrap_or(true)
+    }
+
+    /// Whether the user is looking at this session right now: the window has
+    /// focus, this panel's workspace is the one on screen, and the terminal is
+    /// its active item.
+    fn session_focused(
+        &self,
+        workspace: &Entity<Workspace>,
+        terminal_id: EntityId,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.window_active(cx) {
+            return false;
+        }
+        let workspace_is_active = workspace
+            .read(cx)
+            .multi_workspace()
+            .and_then(|multi_workspace| multi_workspace.upgrade())
+            .map(|multi_workspace| multi_workspace.read(cx).workspace() == workspace)
+            .unwrap_or(true);
+        workspace_is_active
+            && workspace
+                .read(cx)
+                .active_item(cx)
+                .map(|item| item.item_id())
+                == Some(terminal_id)
     }
 
     fn auto_detach_after() -> Duration {
@@ -747,8 +828,8 @@ impl SessionsPanel {
             SessionStatus::Running { .. } => {
                 Indicator::dot().color(Color::Modified).into_any_element()
             }
-            // Heuristic-only status (see status.rs) -- distinct amber color so
-            // it doesn't read as the same "actively running" state.
+            // The session asked for you (see status.rs) -- distinct amber color
+            // so it doesn't read as the same "actively running" state.
             SessionStatus::NeedsInput { .. } => {
                 Indicator::dot().color(Color::Warning).into_any_element()
             }

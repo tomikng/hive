@@ -2196,7 +2196,11 @@ impl AgentPanel {
                     this.refresh_terminal_metadata(terminal_id, cx);
                     this.report_terminal_program(terminal_id, source, cx);
                 }
-                TerminalEvent::Bell => this.mark_terminal_notification(terminal_id, window, cx),
+                // A bell and an OSC 9 / 777 notification mean the same thing
+                // here: the program in the terminal wants attention.
+                TerminalEvent::Bell | TerminalEvent::Notification(_) => {
+                    this.mark_terminal_notification(terminal_id, window, cx)
+                }
                 TerminalEvent::CloseTerminal => {
                     this.close_terminal_from_terminal_event(terminal_id, window, cx);
                 }

@@ -1,3 +1,4 @@
+pub mod claude_settings;
 pub mod file_tree;
 pub mod panel;
 pub mod status;

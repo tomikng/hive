@@ -688,6 +688,10 @@ pub enum Event {
     BreadcrumbsChanged,
     CloseTerminal,
     Bell,
+    /// A program running in this terminal asked to notify the user, via OSC 9
+    /// or OSC 777. Coding agents emit this when a turn ends or they need a
+    /// decision, carrying wording they wrote for the user.
+    Notification(String),
     Wakeup,
     BlinkChanged(bool),
     SelectionsChanged,
@@ -758,6 +762,8 @@ pub(crate) enum TerminalBackendEvent {
         kind: char,
         exit_code: Option<i32>,
     },
+    /// An OSC 9 / OSC 777 notification captured from the raw PTY stream.
+    Notification(String),
 }
 
 impl fmt::Debug for TerminalBackendEvent {
@@ -779,6 +785,7 @@ impl fmt::Debug for TerminalBackendEvent {
             Self::SemanticPrompt { kind, exit_code } => {
                 write!(f, "SemanticPrompt({kind}, {exit_code:?})")
             }
+            Self::Notification(message) => write!(f, "Notification({message})"),
         }
     }
 }
@@ -1673,6 +1680,9 @@ impl Terminal {
                 let current_line = current_grid_line(&self.term.lock());
                 self.command_block_tracker
                     .on_semantic_prompt(kind, exit_code, current_line);
+            }
+            TerminalBackendEvent::Notification(message) => {
+                cx.emit(Event::Notification(message));
             }
         }
     }
