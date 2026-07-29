@@ -18,10 +18,12 @@ use crate::status;
 
 const CHANNEL_KEY: &str = "preferredNotifChannel";
 const HOOKS_KEY: &str = "hooks";
-/// Claude Code fires this when the user submits a prompt: the turn begins.
-const TURN_START_EVENT: &str = "UserPromptSubmit";
-/// ...and this when the main agent has finished responding: the turn ends.
-const TURN_END_EVENT: &str = "Stop";
+/// Claude Code fires `UserPromptSubmit` when the user submits a prompt (the
+/// turn begins) and `Stop` when the main agent has finished responding.
+const TURN_HOOKS: [(&str, &str); 2] = [
+    ("UserPromptSubmit", status::TURN_START_MARKER),
+    ("Stop", status::TURN_END_MARKER),
+];
 /// Notify *and* ring: the bell is what agents other than Claude use, and Hive
 /// falls back to it when a session has never sent an OSC notification.
 const CHANNEL_VALUE: &str = "iterm2_with_bell";
@@ -66,7 +68,13 @@ fn already_configured(text: Option<&str>) -> bool {
         return false; // no file yet — a fresh one is safe to write
     };
     match serde_json::from_str::<Value>(text) {
-        Ok(Value::Object(settings)) => settings.contains_key(CHANNEL_KEY),
+        // Both halves matter: the channel is how the agent says it wants you,
+        // the hooks are how it says it's working. Stale hooks (an older Hive
+        // wrote a command that no longer reaches the terminal) count as
+        // missing, or the offer would never come back to repair them.
+        Ok(Value::Object(settings)) => {
+            settings.contains_key(CHANNEL_KEY) && turn_hooks_current(&settings)
+        }
         _ => true,
     }
 }
@@ -78,7 +86,10 @@ fn with_channel(text: Option<&str>) -> Result<String> {
         Some(text) => serde_json::from_str(text)?,
         None => Map::new(),
     };
-    settings.insert(CHANNEL_KEY.to_string(), Value::from(CHANNEL_VALUE));
+    // A channel the user picked themselves stays; Hive only fills the gap.
+    settings
+        .entry(CHANNEL_KEY)
+        .or_insert_with(|| Value::from(CHANNEL_VALUE));
     add_turn_hooks(&mut settings);
     let mut json = serde_json::to_string_pretty(&Value::Object(settings))?;
     json.push('\n');
@@ -98,41 +109,72 @@ fn add_turn_hooks(settings: &mut Map<String, Value>) {
         return; // not a shape Hive understands; leave it be
     };
 
-    for (event, marker) in [
-        (TURN_START_EVENT, status::TURN_START_MARKER),
-        (TURN_END_EVENT, status::TURN_END_MARKER),
-    ] {
-        let command = marker_command(marker);
+    for (event, marker) in TURN_HOOKS {
         let entries = hooks
             .entry(event)
             .or_insert_with(|| Value::Array(Vec::new()));
         let Some(entries) = entries.as_array_mut() else {
             continue;
         };
-        // Compare the command itself, not the serialised entry: the marker is
-        // full of backslashes, which JSON escapes and a string match wouldn't.
-        let installed = entries.iter().any(|entry| {
-            entry
-                .get("hooks")
-                .and_then(Value::as_array)
-                .is_some_and(|hooks| {
-                    hooks.iter().any(|hook| {
-                        hook.get("command").and_then(Value::as_str) == Some(command.as_str())
-                    })
-                })
-        });
-        if installed {
-            continue;
-        }
+        // Drop Hive's own older markers rather than stacking a new one beside
+        // them — the command has changed once already and will again.
+        entries.retain(|entry| !mentions(entry, marker));
         entries.push(serde_json::json!({
-            "hooks": [{ "type": "command", "command": command }]
+            "hooks": [{ "type": "command", "command": marker_command(marker) }]
         }));
     }
 }
 
-/// Writing the marker must never fail a turn, hence the redirect and `|| true`.
+/// Whether the settings already carry the turn hooks Hive writes today.
+fn turn_hooks_current(settings: &Map<String, Value>) -> bool {
+    let Some(hooks) = settings.get(HOOKS_KEY).and_then(Value::as_object) else {
+        return false;
+    };
+    TURN_HOOKS.iter().all(|(event, marker)| {
+        let command = marker_command(marker);
+        hooks
+            .get(*event)
+            .and_then(Value::as_array)
+            .is_some_and(|entries| entries.iter().any(|entry| has_command(entry, &command)))
+    })
+}
+
+/// Whether a hook entry runs exactly `command`. Compares the command itself,
+/// not the serialised entry: the marker is full of backslashes, which JSON
+/// escapes and a string match wouldn't.
+fn has_command(entry: &Value, command: &str) -> bool {
+    hook_commands(entry).any(|candidate| candidate == command)
+}
+
+/// Whether a hook entry is one of Hive's, of any vintage.
+fn mentions(entry: &Value, marker: &str) -> bool {
+    hook_commands(entry).any(|command| command.contains(marker))
+}
+
+fn hook_commands(entry: &Value) -> impl Iterator<Item = &str> {
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
+}
+
+/// Writes the marker to the terminal the agent is attached to.
+///
+/// Not `/dev/tty`: Claude Code runs hooks without a controlling terminal, so
+/// opening it fails with ENXIO and the marker goes nowhere. The agent process
+/// itself still owns the pty, and a hook may write to it, so the command walks
+/// up the ancestors until it finds one with a tty. Failing must never fail the
+/// turn, hence the swallowed errors and the trailing `true`.
 fn marker_command(marker: &str) -> String {
-    format!("printf '\\033]9;{marker}\\007' > /dev/tty 2>/dev/null || true")
+    format!(
+        "p=$PPID; for _ in 1 2 3; do \
+t=$(ps -o tty= -p $p 2>/dev/null | tr -d ' '); \
+case \"$t\" in ''|'??') p=$(ps -o ppid= -p $p 2>/dev/null | tr -d ' ');; \
+*) printf '\\033]9;{marker}\\007' > \"/dev/$t\" 2>/dev/null; break;; esac; \
+[ -n \"$p\" ] || break; done; true"
+    )
 }
 
 #[cfg(test)]
@@ -175,36 +217,61 @@ mod tests {
 
         // The user's own hooks survive, on the events Hive also writes to.
         assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1);
-        let submit = hooks[TURN_START_EVENT].as_array().unwrap();
+        let submit = hooks["UserPromptSubmit"].as_array().unwrap();
         assert_eq!(submit.len(), 2);
         assert!(submit[0].to_string().contains("mine.sh"));
-        assert!(submit[1].to_string().contains(status::TURN_START_MARKER));
-        assert!(
-            hooks[TURN_END_EVENT].as_array().unwrap()[0]
-                .to_string()
-                .contains(status::TURN_END_MARKER)
-        );
+        assert!(mentions(&submit[1], status::TURN_START_MARKER));
+        assert!(mentions(
+            &hooks["Stop"].as_array().unwrap()[0],
+            status::TURN_END_MARKER
+        ));
 
         // Writing again adds nothing.
         let twice = written(Some(&serde_json::to_string(&settings).unwrap()));
-        assert_eq!(
-            twice[HOOKS_KEY][TURN_START_EVENT].as_array().unwrap().len(),
-            2
-        );
+        assert_eq!(twice[HOOKS_KEY]["UserPromptSubmit"].as_array().unwrap().len(), 2);
+        assert!(turn_hooks_current(&twice));
     }
 
     #[test]
-    fn the_marker_command_writes_to_the_tty() {
+    fn a_stale_marker_is_replaced_not_stacked() {
+        // What an earlier Hive wrote: same marker, a command that could never
+        // reach the terminal.
+        let existing = r#"{
+            "preferredNotifChannel": "iterm2_with_bell",
+            "hooks": {
+                "UserPromptSubmit": [{"hooks": [{"type": "command",
+                    "command": "printf '\\033]9;hive:turn-start\\007' > /dev/tty 2>/dev/null || true"}]}],
+                "Stop": [{"hooks": [{"type": "command",
+                    "command": "printf '\\033]9;hive:turn-end\\007' > /dev/tty 2>/dev/null || true"}]}]
+            }
+        }"#;
+        // Stale hooks must bring the offer back, or there is no way to repair them.
+        assert!(!already_configured(Some(existing)));
+
+        let settings = written(Some(existing));
+        let submit = settings[HOOKS_KEY]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(submit.len(), 1);
+        assert!(!submit[0].to_string().contains("/dev/tty\""));
+        assert!(turn_hooks_current(&settings));
+    }
+
+    #[test]
+    fn the_marker_command_targets_the_agents_own_tty() {
         let command = marker_command(status::TURN_START_MARKER);
-        // Claude Code reads a hook's stdout itself, so the marker has to go
-        // straight to the terminal or Hive never sees it.
-        assert!(command.contains("> /dev/tty"));
+        // Claude Code runs hooks without a controlling terminal: /dev/tty is
+        // ENXIO there, so the command has to find the tty of an ancestor.
+        assert!(!command.contains("> /dev/tty "));
+        assert!(command.contains("ps -o tty="));
+        assert!(command.contains(r#"> "/dev/$t""#));
         assert!(command.contains(r"\033]9;hive:turn-start\007"));
     }
 
     #[test]
-    fn an_existing_channel_is_left_alone() {
-        assert!(already_configured(Some(
+    fn a_channel_the_user_picked_is_kept() {
+        let settings = written(Some(r#"{"preferredNotifChannel": "terminal_bell"}"#));
+        assert_eq!(settings[CHANNEL_KEY], "terminal_bell");
+        // ...but the hooks are still missing, so the offer stands.
+        assert!(!already_configured(Some(
             r#"{"preferredNotifChannel": "terminal_bell"}"#
         )));
     }

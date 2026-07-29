@@ -522,16 +522,39 @@ impl SessionsPanel {
                             id,
                             "Claude Code can't tell Hive when it's working or when it needs you.",
                         )
-                        .on_click(
-                            "Enable",
-                            |_window, cx| {
-                                cx.background_executor()
-                                    .spawn(async {
-                                        claude_settings::enable_notifications().log_err();
-                                    })
-                                    .detach();
-                            },
-                        ),
+                        .on_click("Enable", {
+                            let toast_target = toast_target.downgrade();
+                            move |_window, cx| {
+                                // Say what happened: the write is invisible,
+                                // and Claude Code reads its settings once at
+                                // startup, so nothing changes in the session
+                                // that prompted this.
+                                let toast_target = toast_target.clone();
+                                cx.spawn(async move |cx| {
+                                    let wrote = cx
+                                        .background_executor()
+                                        .spawn(async {
+                                            claude_settings::enable_notifications().log_err()
+                                        })
+                                        .await;
+                                    let message = if wrote.is_some() {
+                                        "Claude Code will report its turns to Hive once you restart it."
+                                    } else {
+                                        "Hive could not write Claude Code's settings — see the log."
+                                    };
+                                    toast_target
+                                        .update(cx, |workspace, cx| {
+                                            let id = NotificationId::composite::<Self>(
+                                                "claude-notifications-result",
+                                            );
+                                            workspace
+                                                .show_toast(Toast::new(id, message).autohide(), cx);
+                                        })
+                                        .ok();
+                                })
+                                .detach();
+                            }
+                        }),
                         cx,
                     );
                 });
