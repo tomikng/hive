@@ -1116,8 +1116,16 @@ impl Render for SessionsPanel {
             };
             let drop_target = workspace.clone();
             root = root.child(
+                // The click sits on the same element as the drag: starting a
+                // drag only clears the pending click of the element that owns
+                // the drag listener, so a click left on a child would still
+                // fire when a drag ended over its own row.
                 div()
                     .id(("session-group-drag", workspace.entity_id()))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |_this, _event, window, cx| {
+                        Self::activate_workspace(&header_workspace, window, cx);
+                    }))
                     .on_drag(dragged_session, |session, _offset, _window, cx| {
                         cx.new(|_| session.clone())
                     })
@@ -1159,10 +1167,7 @@ impl Render for SessionsPanel {
                                 })
                                 .detach_and_log_err(cx);
                         })),
-                    )
-                    .on_click(cx.listener(move |_this, _event, window, cx| {
-                        Self::activate_workspace(&header_workspace, window, cx);
-                    })),
+                    ),
                     ),
             );
             for terminal_view in terminals {
