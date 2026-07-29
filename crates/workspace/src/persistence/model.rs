@@ -122,6 +122,9 @@ pub struct MultiWorkspaceState {
 #[derive(Debug, Clone)]
 pub struct SerializedMultiWorkspace {
     pub active_workspace: SessionWorkspace,
+    /// The window's remaining workspaces, reopened in the background so every
+    /// session survives a restart, not just the focused one.
+    pub background_workspaces: Vec<SessionWorkspace>,
     pub state: MultiWorkspaceState,
 }
 

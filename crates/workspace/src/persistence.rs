@@ -348,12 +348,12 @@ pub fn read_serialized_multi_workspaces(
 
     window_groups
         .into_iter()
-        .filter_map(|group| {
+        .filter_map(|mut group| {
             let window_id = group.first().and_then(|sw| sw.window_id);
             let state = window_id
                 .map(|wid| read_multi_workspace_state(wid, cx))
                 .unwrap_or_default();
-            let active_workspace = state
+            let active_index = state
                 .active_workspace_id
                 .and_then(|id| group.iter().position(|ws| ws.workspace_id == id))
                 // If the persisted active workspace can't be matched (e.g. its
@@ -363,10 +363,14 @@ pub fn read_serialized_multi_workspaces(
                 // restored as the focused window. Only if none have paths do we
                 // fall back to the first entry.
                 .or_else(|| group.iter().position(|ws| !ws.paths.is_empty()))
-                .or(Some(0))
-                .and_then(|index| group.into_iter().nth(index))?;
+                .unwrap_or(0);
+            if active_index >= group.len() {
+                return None;
+            }
+            let active_workspace = group.remove(active_index);
             Some(model::SerializedMultiWorkspace {
                 active_workspace,
+                background_workspaces: group,
                 state,
             })
         })
@@ -4670,20 +4674,31 @@ mod tests {
         assert_eq!(results.len(), 3);
 
         // Window 10: active_workspace_id = 2 picks workspace 2 (paths /b), sidebar open.
+        // Workspace 1 stays behind as a background session.
         let group_10 = &results[0];
         assert_eq!(group_10.active_workspace.workspace_id, WorkspaceId(2));
+        assert_eq!(
+            group_10
+                .background_workspaces
+                .iter()
+                .map(|ws| ws.workspace_id)
+                .collect::<Vec<_>>(),
+            vec![WorkspaceId(1)]
+        );
         assert_eq!(group_10.state.active_workspace_id, Some(WorkspaceId(2)));
         assert_eq!(group_10.state.sidebar_open, true);
 
         // Window 20: active_workspace_id = 3 picks workspace 3 (paths /c), sidebar closed.
         let group_20 = &results[1];
         assert_eq!(group_20.active_workspace.workspace_id, WorkspaceId(3));
+        assert!(group_20.background_workspaces.is_empty());
         assert_eq!(group_20.state.active_workspace_id, Some(WorkspaceId(3)));
         assert_eq!(group_20.state.sidebar_open, false);
 
         // Orphan: no active_workspace_id, falls back to first workspace (id 4).
         let group_none = &results[2];
         assert_eq!(group_none.active_workspace.workspace_id, WorkspaceId(4));
+        assert!(group_none.background_workspaces.is_empty());
         assert_eq!(group_none.state.active_workspace_id, None);
         assert_eq!(group_none.state.sidebar_open, false);
     }
@@ -5735,6 +5750,10 @@ mod tests {
             serialized.active_workspace.workspace_id,
             active_db_id.unwrap(),
         );
+        // background_workspaces stays empty here: each Workspace::test_new
+        // creates its own AppSession, so only the active workspace shares the
+        // queried session id. The background split is covered by
+        // test_read_serialized_multi_workspaces_with_state.
         assert_eq!(serialized.state.project_groups.len(), 2,);
 
         // Verify the serialized project group keys round-trip back to the

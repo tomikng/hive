@@ -9796,6 +9796,7 @@ pub async fn restore_multiworkspace(
 ) -> anyhow::Result<WindowHandle<MultiWorkspace>> {
     let SerializedMultiWorkspace {
         active_workspace,
+        background_workspaces,
         state,
     } = multi_workspace;
 
@@ -9858,6 +9859,48 @@ pub async fn restore_multiworkspace(
     };
 
     apply_restored_multiworkspace_state(window_handle, &state, app_state.fs.clone(), cx).await;
+
+    // Reopen the window's remaining sessions in the background. Each one goes
+    // through the same serialized-workspace lookup as the active one, so its
+    // items (terminals included) come back too.
+    let active_workspace_id = active_workspace.workspace_id;
+    for background in background_workspaces {
+        if background.workspace_id == active_workspace_id {
+            continue;
+        }
+        let result = if background.paths.is_empty() {
+            cx.update(|cx| {
+                open_workspace_by_id(
+                    background.workspace_id,
+                    app_state.clone(),
+                    Some(window_handle),
+                    cx,
+                )
+            })
+            .await
+            .map(|_| ())
+        } else {
+            cx.update(|cx| {
+                Workspace::new_local(
+                    background.paths.paths().to_vec(),
+                    app_state.clone(),
+                    Some(window_handle),
+                    None,
+                    None,
+                    OpenMode::Add,
+                    cx,
+                )
+            })
+            .await
+            .map(|_| ())
+        };
+        if let Err(err) = result {
+            log::error!(
+                "Failed to restore background session {:?}: {err:#}",
+                background.workspace_id
+            );
+        }
+    }
 
     window_handle
         .update(cx, |_, window, _cx| {
