@@ -426,17 +426,15 @@ impl SessionsPanel {
             .read(cx)
             .foreground_process_command_name();
 
-        // Turn markers move the indicator and nothing else: the agent's own
-        // notification is what tells the user, and a marker on every turn
-        // would double it.
-        if let Some(marker) = message.as_deref().and_then(crate::status::turn_marker) {
+        // A turn starting is the one signal that isn't about the user: it says
+        // the agent has work in hand, so it moves the indicator and stops.
+        if let Some(crate::status::TurnMarker::Started) =
+            message.as_deref().and_then(crate::status::turn_marker)
+        {
             let Some(tracker) = self.trackers.get_mut(&terminal_id) else {
                 return;
             };
-            match marker {
-                crate::status::TurnMarker::Started => tracker.signal_turn_started(),
-                crate::status::TurnMarker::Ended => tracker.signal_turn_ended(),
-            }
+            tracker.signal_turn_started();
             let status = tracker.status().clone();
             cx.default_global::<SharedSessionState>()
                 .statuses
@@ -451,7 +449,18 @@ impl SessionsPanel {
                 // Code's `iterm2_with_bell` channel sends both, and the
                 // notification carries the better wording.
                 self.osc_capable.insert(terminal_id);
-                message
+                // A turn ending means the agent wants the user, and is the
+                // only signal that arrives for every such moment — the
+                // notification channel stays quiet for a question asked
+                // mid-turn. Both may fire; they share a notification id, so
+                // the second replaces the first rather than stacking.
+                match crate::status::turn_marker(&message) {
+                    Some(_) => format!(
+                        "{} is waiting for you",
+                        foreground.as_deref().unwrap_or("The agent")
+                    ),
+                    None => message,
+                }
             }
             None => {
                 if self.osc_capable.contains(&terminal_id) {
