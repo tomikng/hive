@@ -3,9 +3,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter,
-    FocusHandle, Focusable, Pixels, Render, Subscription, SystemNotification, WeakEntity, Window,
-    actions, px,
+    AnyWindowHandle, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, Pixels, Render, Subscription, SystemNotification, WeakEntity, Window, actions, px,
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
@@ -217,8 +216,10 @@ impl SessionsPanel {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let terminals: Vec<Entity<TerminalView>> =
-            workspace.read(cx).items_of_type::<TerminalView>(cx).collect();
+        let terminals: Vec<Entity<TerminalView>> = workspace
+            .read(cx)
+            .items_of_type::<TerminalView>(cx)
+            .collect();
         let window_active = self
             .window_handle
             .update(cx, |_, window, _| window.is_window_active())
@@ -236,10 +237,15 @@ impl SessionsPanel {
             .and_then(|multi_workspace| multi_workspace.upgrade())
             .map(|multi_workspace| multi_workspace.read(cx).workspace() == &workspace)
             .unwrap_or(true);
-        let active_item_id = workspace.read(cx).active_item(cx).map(|item| item.item_id());
+        let active_item_id = workspace
+            .read(cx)
+            .active_item(cx)
+            .map(|item| item.item_id());
 
-        let live_ids: HashSet<EntityId> =
-            terminals.iter().map(|terminal| terminal.entity_id()).collect();
+        let live_ids: HashSet<EntityId> = terminals
+            .iter()
+            .map(|terminal| terminal.entity_id())
+            .collect();
         {
             let shared = cx.default_global::<SharedSessionState>();
             for id in self.trackers.keys() {
@@ -251,12 +257,17 @@ impl SessionsPanel {
         }
         self.trackers.retain(|id, _| live_ids.contains(id));
         self.activity.retain(|id, _| live_ids.contains(id));
-        self.bell_subscriptions.retain(|id, _| live_ids.contains(id));
+        self.bell_subscriptions
+            .retain(|id, _| live_ids.contains(id));
 
         let cwds: Vec<PathBuf> = terminals
             .iter()
             .filter_map(|terminal_view| {
-                terminal_view.read(cx).terminal().read(cx).working_directory()
+                terminal_view
+                    .read(cx)
+                    .terminal()
+                    .read(cx)
+                    .working_directory()
             })
             .collect();
         self.follow_terminal_repos(&cwds, cx);
@@ -347,8 +358,7 @@ impl SessionsPanel {
             {
                 if is_agent(command)
                     && (bell_edge
-                        || now.saturating_duration_since(*since)
-                            >= Self::agent_notify_threshold())
+                        || now.saturating_duration_since(*since) >= Self::agent_notify_threshold())
                 {
                     if !focused {
                         cx.default_global::<SharedSessionState>()
@@ -399,8 +409,7 @@ impl SessionsPanel {
                 let terminal_view = terminal_view.clone();
                 cx.spawn(async move |_, cx| {
                     if let Some(text) = generate.await {
-                        let mut title =
-                            text.lines().next().unwrap_or_default().trim().to_string();
+                        let mut title = text.lines().next().unwrap_or_default().trim().to_string();
                         title.truncate(40);
                         if !title.is_empty() {
                             terminal_view.update(cx, |terminal_view, cx| {
@@ -439,8 +448,7 @@ impl SessionsPanel {
                             "session-finished",
                             terminal_view.entity_id(),
                         ));
-                        let message =
-                            format!("{} finished · {mins}m {secs}s", finished.command);
+                        let message = format!("{} finished · {mins}m {secs}s", finished.command);
                         workspace.update(cx, |workspace, cx| {
                             workspace.show_toast(Toast::new(id, message).autohide(), cx);
                         });
@@ -532,8 +540,7 @@ impl SessionsPanel {
             }
             log::info!("sessions_panel: auto-attaching repo {}", root.display());
             self.auto_attached_repos.insert(root.clone(), now);
-            let create = project
-                .update(cx, |project, cx| project.create_worktree(&root, true, cx));
+            let create = project.update(cx, |project, cx| project.create_worktree(&root, true, cx));
             let workspace = self.workspace.clone();
             let window_handle = self.window_handle;
             cx.spawn(async move |_, cx| {
@@ -572,13 +579,8 @@ impl SessionsPanel {
                             .is_some_and(|path| path.worktree_id == worktree_id)
                     });
                     if !has_open_items {
-                        log::info!(
-                            "sessions_panel: auto-detaching repo {}",
-                            root.display()
-                        );
-                        project.update(cx, |project, cx| {
-                            project.remove_worktree(worktree_id, cx)
-                        });
+                        log::info!("sessions_panel: auto-detaching repo {}", root.display());
+                        project.update(cx, |project, cx| project.remove_worktree(worktree_id, cx));
                         detached.push(root.clone());
                     }
                 }
@@ -666,7 +668,11 @@ impl SessionsPanel {
                 path.starts_with(repository.read(cx).work_directory_abs_path.as_ref())
             })
             .max_by_key(|repository| {
-                repository.read(cx).work_directory_abs_path.as_os_str().len()
+                repository
+                    .read(cx)
+                    .work_directory_abs_path
+                    .as_os_str()
+                    .len()
             })
             .cloned()
     }
@@ -713,8 +719,7 @@ impl SessionsPanel {
             .working_directory()
             .and_then(|cwd| Self::repository_containing(workspace.read(cx), &cwd, cx))
             .filter(|repository| {
-                session_root_repo
-                    != Some(repository.read(cx).work_directory_abs_path.as_ref())
+                session_root_repo != Some(repository.read(cx).work_directory_abs_path.as_ref())
             })
             .and_then(|repository| Self::repository_diff_stat(&repository, cx));
         let (status, unseen) = cx
@@ -1090,14 +1095,19 @@ impl Render for SessionsPanel {
                 .and_then(|root| Self::repository_containing(workspace.read(cx), &root, cx));
             let root_repo_path = root_repository
                 .as_ref()
-                .map(|repository| {
-                    repository.read(cx).work_directory_abs_path.to_path_buf()
-                });
-            let mut header = h_flex().gap_2().child(
-                Label::new(name.clone())
-                    .size(LabelSize::Small)
-                    .color(if is_active { Color::Default } else { Color::Muted }),
-            );
+                .map(|repository| repository.read(cx).work_directory_abs_path.to_path_buf());
+            let mut header =
+                h_flex()
+                    .gap_2()
+                    .child(
+                        Label::new(name.clone())
+                            .size(LabelSize::Small)
+                            .color(if is_active {
+                                Color::Default
+                            } else {
+                                Color::Muted
+                            }),
+                    );
             if let Some((files, added, deleted)) = root_repository
                 .as_ref()
                 .and_then(|repository| Self::repository_diff_stat(repository, cx))
@@ -1132,42 +1142,44 @@ impl Render for SessionsPanel {
                     .drag_over::<DraggedSession>(|style, _, _, cx| {
                         style.bg(cx.theme().colors().drop_target_background)
                     })
-                    .on_drop(cx.listener(
-                        move |this, dragged: &DraggedSession, _window, cx| {
+                    .on_drop(
+                        cx.listener(move |this, dragged: &DraggedSession, _window, cx| {
                             this.move_session(&dragged.workspace, &drop_target, cx);
-                        },
-                    ))
+                        }),
+                    )
                     .child(
-                ListItem::new(("session-group", workspace.entity_id()))
-                    .child(header)
-                    .end_slot_on_hover(
-                        IconButton::new(
-                            ("close-session-group", workspace.entity_id()),
-                            IconName::Close,
-                        )
-                        .icon_size(IconSize::XSmall)
-                        .icon_color(Color::Muted)
-                        .tooltip(Tooltip::text("Close Session"))
-                        .on_click(cx.listener(move |_this, _event, window, cx| {
-                            cx.stop_propagation();
-                            let Some(multi_workspace) = close_session_workspace
-                                .read(cx)
-                                .multi_workspace()
-                                .and_then(|multi_workspace| multi_workspace.upgrade())
-                            else {
-                                return;
-                            };
-                            multi_workspace
-                                .update(cx, |multi_workspace, cx| {
-                                    multi_workspace.close_workspace(
-                                        &close_session_workspace,
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .detach_and_log_err(cx);
-                        })),
-                    ),
+                        ListItem::new(("session-group", workspace.entity_id()))
+                            .child(header)
+                            .end_slot_on_hover(
+                                IconButton::new(
+                                    ("close-session-group", workspace.entity_id()),
+                                    IconName::Close,
+                                )
+                                .icon_size(IconSize::XSmall)
+                                .icon_color(Color::Muted)
+                                .tooltip(Tooltip::text("Close Session"))
+                                .on_click(cx.listener(
+                                    move |_this, _event, window, cx| {
+                                        cx.stop_propagation();
+                                        let Some(multi_workspace) = close_session_workspace
+                                            .read(cx)
+                                            .multi_workspace()
+                                            .and_then(|multi_workspace| multi_workspace.upgrade())
+                                        else {
+                                            return;
+                                        };
+                                        multi_workspace
+                                            .update(cx, |multi_workspace, cx| {
+                                                multi_workspace.close_workspace(
+                                                    &close_session_workspace,
+                                                    window,
+                                                    cx,
+                                                )
+                                            })
+                                            .detach_and_log_err(cx);
+                                    },
+                                )),
+                            ),
                     ),
             );
             for terminal_view in terminals {

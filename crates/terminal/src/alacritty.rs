@@ -32,6 +32,8 @@ use anyhow::{Context as _, Result};
 use futures::channel::mpsc::UnboundedSender;
 use util::paths::PathStyle;
 use vte::ansi::Handler;
+#[cfg(target_os = "windows")]
+use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 #[cfg(unix)]
 use {
     alacritty_terminal::{
@@ -40,8 +42,6 @@ use {
     },
     polling::{Event as PollingEvent, PollMode, Poller},
 };
-#[cfg(target_os = "windows")]
-use windows::Win32::{Foundation::HANDLE, System::Threading::GetProcessId};
 
 use crate::{
     Cell, Color, Content, Cursor, CursorShape, Hyperlink, HyperlinkData, IndexedCell, Modes, Point,
@@ -217,8 +217,8 @@ pub(super) fn spawn_event_loop(
     // forwarded to alacritty unchanged, so normal terminal output is unaffected.
     #[cfg(unix)]
     let event_loop = {
-        let tee_pty = TeePty::new(pty, events_tx.clone())
-            .context("failed to set up OSC 133 tee for pty")?;
+        let tee_pty =
+            TeePty::new(pty, events_tx.clone()).context("failed to set up OSC 133 tee for pty")?;
         EventLoop::new(term, ZedListener(events_tx), tee_pty, drain_on_exit, false)
             .context("failed to create event loop")?
     };

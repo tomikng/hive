@@ -233,7 +233,10 @@ mod tests {
     #[test]
     fn detects_supported_shells_by_program_basename() {
         assert_eq!(supported_shell("/bin/zsh"), Some(SupportedShell::Zsh));
-        assert_eq!(supported_shell("/usr/local/bin/bash"), Some(SupportedShell::Bash));
+        assert_eq!(
+            supported_shell("/usr/local/bin/bash"),
+            Some(SupportedShell::Bash)
+        );
         assert_eq!(supported_shell("/bin/fish"), None);
         assert_eq!(supported_shell("/bin/sh"), None);
     }
@@ -267,7 +270,10 @@ mod tests {
         let result = inject(&Shell::Program("zsh".to_string()), false, &mut env);
         assert!(result.is_none());
         let zdotdir = env.get("ZDOTDIR").expect("ZDOTDIR should be set");
-        assert!(fs::metadata(zdotdir).is_ok(), "ZDOTDIR should exist on disk");
+        assert!(
+            fs::metadata(zdotdir).is_ok(),
+            "ZDOTDIR should exist on disk"
+        );
         assert!(fs::metadata(Path::new(zdotdir).join(".zshrc")).is_ok());
     }
 

@@ -1283,8 +1283,7 @@ fn reveal_terminal_cwd(
                                 // restricted (git and tasks disabled) with no
                                 // visible cue. Surface the standard prompt.
                                 workspace.update_in(cx, |workspace, window, cx| {
-                                    workspace
-                                        .show_worktree_trust_security_modal(false, window, cx);
+                                    workspace.show_worktree_trust_security_modal(false, window, cx);
                                 })
                             })
                             .detach_and_log_err(cx);
