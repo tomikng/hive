@@ -1331,11 +1331,11 @@ fn subscribe_for_terminal_events(
                     cx.emit(Event::Wakeup);
                 }
 
-                // Re-emitted so listeners on the view (the sessions panel) see
-                // it; the terminal itself has nothing to do with it.
-                Event::Notification(message) => {
-                    cx.emit(Event::Notification(message.clone()));
-                }
+                // Handled by listeners on the `Terminal` itself (the sessions
+                // panel), which is where the sequence arrives. Nothing
+                // subscribes to the view for it, so re-emitting would be dead
+                // plumbing.
+                Event::Notification(_) => {}
 
                 Event::BlinkChanged(blinking) => {
                     terminal_view.blinking_terminal_enabled = *blinking;
