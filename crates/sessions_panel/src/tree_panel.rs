@@ -6,6 +6,7 @@ use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
     Pixels, Render, WeakEntity, Window, actions, px,
 };
+use file_icons::FileIcons;
 use terminal_view::TerminalView;
 use ui::{ListItem, Tooltip, prelude::*};
 use util::ResultExt;
@@ -281,16 +282,29 @@ impl FileTreePanel {
         let path = entry.path.clone();
         let is_dir = entry.is_dir;
         let expanded = is_dir && self.tree_expanded.contains(&path);
-        let icon = if is_dir {
-            if expanded { IconName::FolderOpen } else { IconName::Folder }
+        // The icon theme knows a .tsx from a .json; the plain file and folder
+        // icons stand in for whatever it has no entry for.
+        let themed_icon = if is_dir {
+            FileIcons::get_folder_icon(expanded, &entry.path, cx)
         } else {
-            IconName::File
+            FileIcons::get_icon(&entry.path, cx)
         };
+        let icon = themed_icon
+            .map(Icon::from_path)
+            .unwrap_or_else(|| {
+                Icon::new(if is_dir {
+                    if expanded { IconName::FolderOpen } else { IconName::Folder }
+                } else {
+                    IconName::File
+                })
+            })
+            .size(IconSize::Small)
+            .color(Color::Muted);
         let workspace = self.workspace.clone();
 
         ListItem::new(entry.path.to_string_lossy().into_owned())
             .indent_level(depth)
-            .start_slot(Icon::new(icon).size(IconSize::Small).color(Color::Muted))
+            .start_slot(icon)
             .child(Label::new(entry.name.clone()).single_line())
             .on_click(cx.listener(move |this, _event, window, cx| {
                 if is_dir {
