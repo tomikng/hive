@@ -49,12 +49,11 @@ use ui::{
 };
 use util::ResultExt;
 use workspace::{
-    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, OpenOptions,
-    OpenVisible, Pane, Toast, ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
+    CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
+    ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
     item::{
         HighlightedText, Item, ItemEvent, SerializableItem, TabContentParams, TabTooltipContent,
     },
-    notifications::NotificationId,
     register_serializable_item,
     searchable::{
         Direction, SearchEvent, SearchOptions, SearchToken, SearchableItem, SearchableItemHandle,
@@ -1225,12 +1224,13 @@ fn terminal_rerun_override(task: &TaskId) -> zed_actions::Rerun {
     }
 }
 
-/// Reveals `cwd` in the project panel if it's inside the project's worktrees;
-/// otherwise offers a toast to open it as a new project folder. Never re-roots
-/// the project (no worktree creation/removal) — see p5-task-1-brief.md.
+/// Reveals `cwd` in the project panel if it's inside the project's worktrees.
+/// A cwd outside the project is left alone: repos are auto-attached as
+/// worktrees elsewhere, so the old "Open as Project" toast was pure noise.
+/// Never re-roots the project (no worktree creation/removal) — see
+/// p5-task-1-brief.md.
 fn reveal_terminal_cwd(
     project: &WeakEntity<Project>,
-    workspace: &WeakEntity<Workspace>,
     cwd: PathBuf,
     cx: &mut Context<TerminalView>,
 ) {
@@ -1249,51 +1249,7 @@ fn reveal_terminal_cwd(
                 cx.emit(ProjectEvent::RevealInProjectPanel(entry_id))
             })
             .ok();
-        return;
     }
-
-    let toast_workspace = workspace.clone();
-    let open_cwd = cwd.clone();
-    workspace
-        .update(cx, |workspace, cx| {
-            workspace.show_toast(
-                Toast::new(
-                    NotificationId::named("terminal-view-cwd-outside-project".into()),
-                    format!("Terminal is in {}", cwd.display()),
-                )
-                .on_click("Open as Project", move |_window, cx| {
-                    toast_workspace
-                        .update_in(cx, |workspace, window, cx| {
-                            let open = workspace.open_paths(
-                                vec![open_cwd.clone()],
-                                OpenOptions {
-                                    visible: Some(OpenVisible::All),
-                                    ..Default::default()
-                                },
-                                None,
-                                window,
-                                cx,
-                            );
-                            cx.spawn_in(window, async move |workspace, cx| {
-                                for result in open.await.into_iter().flatten() {
-                                    result.log_err();
-                                }
-                                // A folder added to an existing window skips the
-                                // window-open trust check, leaving the worktree
-                                // restricted (git and tasks disabled) with no
-                                // visible cue. Surface the standard prompt.
-                                workspace.update_in(cx, |workspace, window, cx| {
-                                    workspace.show_worktree_trust_security_modal(false, window, cx);
-                                })
-                            })
-                            .detach_and_log_err(cx);
-                        })
-                        .ok();
-                }),
-                cx,
-            );
-        })
-        .ok();
 }
 
 fn subscribe_for_terminal_events(
@@ -1369,12 +1325,7 @@ fn subscribe_for_terminal_events(
                         if cwd != terminal_view.last_revealed_cwd {
                             terminal_view.last_revealed_cwd = cwd.clone();
                             if let Some(cwd) = cwd {
-                                reveal_terminal_cwd(
-                                    &terminal_view.project,
-                                    &terminal_view.workspace,
-                                    cwd,
-                                    cx,
-                                );
+                                reveal_terminal_cwd(&terminal_view.project, cwd, cx);
                             }
                         }
                     }
