@@ -828,11 +828,12 @@ impl SessionsPanel {
             SessionStatus::Running { .. } => {
                 Indicator::dot().color(Color::Modified).into_any_element()
             }
-            // The session asked for you (see status.rs) -- distinct amber color
-            // so it doesn't read as the same "actively running" state.
-            SessionStatus::NeedsInput { .. } => {
-                Indicator::dot().color(Color::Warning).into_any_element()
-            }
+            // The session asked for you (see status.rs) -- a green tick reads
+            // as "your turn", where a dot read as another shade of running.
+            SessionStatus::NeedsInput { .. } => Icon::new(IconName::Check)
+                .size(IconSize::XSmall)
+                .color(Color::Success)
+                .into_any_element(),
             // Warp-style: quiet session with activity you haven't looked at.
             SessionStatus::Idle if unseen => {
                 Indicator::dot().color(Color::Accent).into_any_element()
