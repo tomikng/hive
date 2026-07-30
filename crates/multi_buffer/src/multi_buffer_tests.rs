@@ -2507,6 +2507,62 @@ fn test_stale_anchor_after_buffer_removal_and_path_reuse(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn test_remove_excerpts_for_paths(cx: &mut TestAppContext) {
+    let buffers: Vec<_> = (0..4)
+        .map(|i| cx.new(|cx| Buffer::local(format!("one {i}\ntwo {i}\n"), cx)))
+        .collect();
+    let paths: Vec<_> = (0..4)
+        .map(|i| PathKey::with_sort_prefix(i as u64, rel_path(&format!("file{i}")).into_arc()))
+        .collect();
+
+    let batch = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+    let sequential = cx.new(|_| MultiBuffer::new(Capability::ReadWrite));
+    for multibuffer in [&batch, &sequential] {
+        multibuffer.update(cx, |multibuffer, cx| {
+            for (path, buffer) in paths.iter().zip(&buffers) {
+                multibuffer.set_excerpts_for_path(
+                    path.clone(),
+                    buffer.clone(),
+                    [Point::new(0, 0)..Point::new(1, 5)],
+                    0,
+                    cx,
+                );
+            }
+        });
+    }
+
+    // Unsorted, and includes the last path to exercise the trailing excerpt adjustment.
+    let removed = vec![paths[3].clone(), paths[1].clone()];
+    batch.update(cx, |multibuffer, cx| {
+        multibuffer.remove_excerpts_for_paths(removed.clone(), cx)
+    });
+    sequential.update(cx, |multibuffer, cx| {
+        for path in &removed {
+            multibuffer.remove_excerpts(path.clone(), cx);
+        }
+    });
+
+    let batch_snapshot = batch.read_with(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    let sequential_snapshot = sequential.read_with(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(batch_snapshot.text(), sequential_snapshot.text());
+    assert_eq!(
+        batch_snapshot.all_buffer_ids().collect::<Vec<_>>(),
+        sequential_snapshot.all_buffer_ids().collect::<Vec<_>>()
+    );
+
+    // Removing the remaining paths, plus one that no longer exists, empties the multibuffer.
+    batch.update(cx, |multibuffer, cx| {
+        multibuffer.remove_excerpts_for_paths(
+            vec![paths[0].clone(), paths[1].clone(), paths[2].clone()],
+            cx,
+        )
+    });
+    batch.read_with(cx, |multibuffer, cx| {
+        assert_eq!(multibuffer.snapshot(cx).text(), "");
+    });
+}
+
+#[gpui::test]
 async fn test_map_excerpt_ranges(cx: &mut TestAppContext) {
     let base_text = indoc!(
         "

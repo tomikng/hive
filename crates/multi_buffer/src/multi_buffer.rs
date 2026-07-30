@@ -596,11 +596,19 @@ fn find_diff_state(
 }
 
 fn remove_diff_state(diffs: &mut SumTree<DiffStateSnapshot>, buffer_id: BufferId) {
-    let key = Some(buffer_id);
+    remove_diff_states(diffs, &[buffer_id]);
+}
+
+/// `buffer_ids` must be sorted in ascending order.
+fn remove_diff_states(diffs: &mut SumTree<DiffStateSnapshot>, buffer_ids: &[BufferId]) {
     let mut cursor = diffs.cursor::<Option<BufferId>>(());
-    let mut new_tree = cursor.slice(&key, Bias::Left);
-    if key == cursor.end() {
-        cursor.next();
+    let mut new_tree = SumTree::new(());
+    for &buffer_id in buffer_ids {
+        let key = Some(buffer_id);
+        new_tree.append(cursor.slice(&key, Bias::Left), ());
+        if key == cursor.end() {
+            cursor.next();
+        }
     }
     new_tree.append(cursor.suffix(), ());
     drop(cursor);

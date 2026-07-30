@@ -12,7 +12,7 @@ use ztracing::instrument;
 use crate::{
     Anchor, BufferState, BufferStateSnapshot, DiffChangeKind, Event, Excerpt, ExcerptOffset,
     ExcerptRange, ExcerptSummary, ExpandExcerptDirection, MultiBuffer, MultiBufferOffset,
-    PathKeyIndex, build_excerpt_ranges, remove_diff_state,
+    PathKeyIndex, build_excerpt_ranges, remove_diff_state, remove_diff_states,
 };
 
 #[derive(PartialEq, Eq, Ord, PartialOrd, Clone, Hash, Debug)]
@@ -623,63 +623,92 @@ impl MultiBuffer {
     }
 
     pub fn remove_excerpts(&mut self, path: PathKey, cx: &mut Context<Self>) {
+        self.remove_excerpts_for_paths(vec![path], cx);
+    }
+
+    pub fn remove_excerpts_for_paths(&mut self, mut paths: Vec<PathKey>, cx: &mut Context<Self>) {
         assert_eq!(self.history.transaction_depth(), 0);
         self.sync_mut(cx);
+        paths.sort();
+        paths.dedup();
 
         let mut snapshot = self.snapshot.get_mut();
         let mut cursor = snapshot
             .excerpts
             .cursor::<Dimensions<PathKey, ExcerptOffset>>(());
         let mut new_excerpts = SumTree::new(());
-        new_excerpts.append(cursor.slice(&path, Bias::Left), ());
-        let mut edit_start = cursor.position.1;
-        let mut buffer_id = None;
-        if let Some(excerpt) = cursor.item()
-            && excerpt.path_key == path
-        {
-            buffer_id = Some(excerpt.buffer_id);
+        let mut excerpt_edits = Vec::new();
+        let mut removed_buffer_ids = Vec::new();
+        let mut removed_len = 0;
+        for path in &paths {
+            new_excerpts.append(cursor.slice(path, Bias::Left), ());
+            let Some(excerpt) = cursor.item() else {
+                break;
+            };
+            if &excerpt.path_key != path {
+                continue;
+            }
+            removed_buffer_ids.push(excerpt.buffer_id);
+            let edit_start = cursor.position.1;
+            cursor.seek_forward(path, Bias::Right);
+            let edit_end = cursor.position.1;
+            let mut new_start = edit_start;
+            new_start -= removed_len;
+            excerpt_edits.push(Edit {
+                old: edit_start..edit_end,
+                new: new_start..new_start,
+            });
+            removed_len += edit_end - edit_start;
         }
-        cursor.seek(&path, Bias::Right);
-        let edit_end = cursor.position.1;
         let suffix = cursor.suffix();
         let changed_trailing_excerpt = suffix.is_empty();
         new_excerpts.append(suffix, ());
-
-        if let Some(buffer_id) = buffer_id {
-            snapshot.buffers.remove(&buffer_id);
-            remove_diff_state(&mut snapshot.diffs, buffer_id);
-            self.buffers.remove(&buffer_id);
-            self.diffs.remove(&buffer_id);
-            cx.emit(Event::BuffersRemoved {
-                removed_buffer_ids: vec![buffer_id],
-            })
-        }
         drop(cursor);
+
+        let Some(last_edit) = excerpt_edits.last_mut() else {
+            return;
+        };
+
+        removed_buffer_ids.sort();
+        for buffer_id in &removed_buffer_ids {
+            snapshot.buffers.remove(buffer_id);
+            self.buffers.remove(buffer_id);
+            self.diffs.remove(buffer_id);
+        }
+        remove_diff_states(&mut snapshot.diffs, &removed_buffer_ids);
+        cx.emit(Event::BuffersRemoved {
+            removed_buffer_ids: removed_buffer_ids.clone(),
+        });
+
         if changed_trailing_excerpt {
             snapshot.trailing_excerpt_update_count += 1;
             new_excerpts.update_last(
                 |excerpt| {
                     if excerpt.has_trailing_newline {
                         excerpt.has_trailing_newline = false;
-                        edit_start.0.0 = edit_start
-                            .0
-                            .0
-                            .checked_sub(1)
-                            .expect("should have at least one excerpt");
+                        let decrement = |offset: &mut ExcerptOffset| {
+                            offset.0.0 = offset
+                                .0
+                                .0
+                                .checked_sub(1)
+                                .expect("should have at least one excerpt");
+                        };
+                        decrement(&mut last_edit.old.start);
+                        decrement(&mut last_edit.new.start);
+                        decrement(&mut last_edit.new.end);
                     }
                 },
                 (),
             )
         }
 
-        let edit = Edit {
-            old: edit_start..edit_end,
-            new: edit_start..edit_start,
-        };
         snapshot.excerpts = new_excerpts;
 
-        let edits =
-            Self::sync_diff_transforms(&mut snapshot, vec![edit], DiffChangeKind::BufferEdited);
+        let edits = Self::sync_diff_transforms(
+            &mut snapshot,
+            excerpt_edits,
+            DiffChangeKind::BufferEdited,
+        );
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
         }

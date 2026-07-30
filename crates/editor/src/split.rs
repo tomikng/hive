@@ -1316,13 +1316,17 @@ impl SplittableEditor {
     }
 
     pub fn remove_excerpts_for_path(&mut self, path: PathKey, cx: &mut Context<Self>) {
+        self.remove_excerpts_for_paths(vec![path], cx);
+    }
+
+    pub fn remove_excerpts_for_paths(&mut self, paths: Vec<PathKey>, cx: &mut Context<Self>) {
         self.rhs_multibuffer.update(cx, |rhs_multibuffer, cx| {
-            rhs_multibuffer.remove_excerpts(path.clone(), cx);
+            rhs_multibuffer.remove_excerpts_for_paths(paths.clone(), cx);
         });
 
         if let Some(lhs) = &self.lhs {
             lhs.multibuffer.update(cx, |lhs_multibuffer, cx| {
-                lhs_multibuffer.remove_excerpts(path, cx);
+                lhs_multibuffer.remove_excerpts_for_paths(paths, cx);
             });
         }
     }

@@ -657,16 +657,20 @@ impl DiffMultibuffer {
                 .collect::<HashMap<_, _>>();
 
             this.editor.update(cx, |editor, cx| {
+                let mut removed_paths = Vec::with_capacity(previous_paths.len());
+                let mut removed_buffer_ids = Vec::with_capacity(previous_paths.len());
                 for (path, buffer_id) in previous_paths {
                     if let Some(repo_path) = repo_path_by_display_id.get(&buffer_id) {
                         this.buffer_subscriptions.remove(repo_path);
                     }
+                    removed_paths.push(path);
+                    removed_buffer_ids.push(buffer_id);
+                }
+                if !removed_paths.is_empty() {
                     editor.rhs_editor().update(cx, |editor, cx| {
-                        conflict_view::buffers_removed(editor, &[buffer_id], cx);
+                        conflict_view::buffers_removed(editor, &removed_buffer_ids, cx);
                     });
-                    let _span = ztracing::info_span!("remove_excerpts_for_path");
-                    _span.enter();
-                    editor.remove_excerpts_for_path(path, cx);
+                    editor.remove_excerpts_for_paths(removed_paths, cx);
                 }
             });
 
