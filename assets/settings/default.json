@@ -1655,6 +1655,7 @@
     "**/Thumbs.db",
     "**/.classpath",
     "**/.settings",
+    "**/.pnpm-store",
   ],
   // Files or globs of files that will be included by Hive, even when ignored by git. This is useful
   // for files that are not tracked by git, but are still important to your project. Note that globs
