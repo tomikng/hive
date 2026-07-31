@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyWindowHandle, App, AsyncWindowContext, Context, DismissEvent, Entity, EntityId,
     EventEmitter, FocusHandle, Focusable, Pixels, PromptLevel, Render, Subscription,
-    SystemNotification,
-    WeakEntity, Window, actions, anchored, deferred, px,
+    SystemNotification, WeakEntity, Window, actions, anchored, deferred, px,
 };
 use project::git_store::{GitStoreEvent, RepositoryEvent};
 use terminal_view::{RenameTerminal, TerminalView, terminal_panel::TerminalPanel};
@@ -14,8 +13,9 @@ use ui::{
     CommonAnimationExt as _, ContextMenu, Indicator, ListItem, PopoverMenu, Tooltip, prelude::*,
 };
 use workspace::{
-    Toast, Workspace,
+    Pane, Toast, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
+    move_item,
     notifications::NotificationId,
 };
 
@@ -91,6 +91,37 @@ impl Render for DraggedSession {
             .bg(cx.theme().colors().elevated_surface_background)
             .child(Label::new(self.name.clone()).size(LabelSize::Small))
     }
+}
+
+/// A terminal row picked up in the rail, carried until it's dropped on another
+/// row of the same session.
+#[derive(Clone)]
+struct DraggedTerminal {
+    workspace: Entity<Workspace>,
+    terminal: Entity<TerminalView>,
+    title: SharedString,
+}
+
+impl Render for DraggedTerminal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(cx.theme().colors().elevated_surface_background)
+            .child(Label::new(self.title.clone()).size(LabelSize::Small))
+    }
+}
+
+/// The terminal's name as the user sees it: its rename if it has one, else the
+/// live process/cwd title. A rename is stored on the view, so `Terminal::title`
+/// alone never reflects it.
+fn terminal_title(terminal_view: &Entity<TerminalView>, cx: &App) -> String {
+    let terminal_view = terminal_view.read(cx);
+    terminal_view
+        .custom_title()
+        .map(str::to_owned)
+        .unwrap_or_else(|| terminal_view.terminal().read(cx).title(true))
 }
 
 /// The session's root: its first visible worktree — the project this session
@@ -376,7 +407,7 @@ impl SessionsPanel {
                 if finished.duration >= threshold {
                     let mins = finished.duration.as_secs() / 60;
                     let secs = finished.duration.as_secs() % 60;
-                    let title = terminal_view.read(cx).terminal().read(cx).title(true);
+                    let title = terminal_title(&terminal_view, cx);
                     if !window_active {
                         cx.show_system_notification(SystemNotification {
                             tag: format!("hive-session-{}", terminal_view.entity_id()).into(),
@@ -497,7 +528,7 @@ impl SessionsPanel {
                 .unseen
                 .insert(terminal_id);
         }
-        let session = terminal_view.read(cx).terminal().read(cx).title(true);
+        let session = terminal_title(terminal_view, cx);
         self.notify_session_activity(
             terminal_view,
             &workspace,
@@ -859,7 +890,7 @@ impl SessionsPanel {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let terminal_id = terminal_view.entity_id();
-        let title = terminal_view.read(cx).terminal().read(cx).title(true);
+        let title = terminal_title(&terminal_view, cx);
         // A terminal sitting in a different repo than the session root shows
         // that repo's diff on its own row — "where this terminal is now".
         let foreign_repo_stat = terminal_view
@@ -917,9 +948,16 @@ impl SessionsPanel {
         let activate_workspace = workspace.clone();
         let menu_workspace = workspace.clone();
         let menu_terminal_view = terminal_view.clone();
-        let close_workspace = workspace;
+        let drop_workspace = workspace.clone();
+        let close_workspace = workspace.clone();
         let close_terminal_view = terminal_view.clone();
-        ListItem::new(("session", terminal_view.entity_id()))
+        let drop_terminal_view = terminal_view.clone();
+        let dragged_terminal = DraggedTerminal {
+            workspace,
+            terminal: terminal_view.clone(),
+            title: title.clone().into(),
+        };
+        let row = ListItem::new(("session", terminal_view.entity_id()))
             .start_slot(indicator)
             .on_secondary_mouse_down(cx.listener(
                 move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -962,7 +1000,13 @@ impl SessionsPanel {
                         cx,
                     );
                 })),
-            )
+            );
+        // The click sits on the same element as the drag, for the reason the
+        // session rows do: starting a drag only clears the pending click of
+        // the element that owns the drag listener.
+        div()
+            .id(("session-drag", terminal_id))
+            .cursor_pointer()
             .on_click(cx.listener(move |_this, _event, window, cx| {
                 cx.default_global::<SharedSessionState>()
                     .unseen
@@ -972,6 +1016,18 @@ impl SessionsPanel {
                     workspace.activate_item(&terminal_view, true, true, window, cx);
                 });
             }))
+            .on_drag(dragged_terminal, |terminal, _offset, _window, cx| {
+                cx.new(|_| terminal.clone())
+            })
+            .drag_over::<DraggedTerminal>(|style, _, _, cx| {
+                style.bg(cx.theme().colors().drop_target_background)
+            })
+            .on_drop(
+                cx.listener(move |this, dragged: &DraggedTerminal, window, cx| {
+                    this.move_terminal(dragged, &drop_terminal_view, &drop_workspace, window, cx);
+                }),
+            )
+            .child(row)
     }
 
     /// Right-click menu for a terminal row.
@@ -1202,7 +1258,6 @@ impl SessionsPanel {
             let Some(multi_workspace) = workspace
                 .read_with(cx, |workspace, _| workspace.multi_workspace().cloned())
                 .and_then(|multi_workspace| multi_workspace.upgrade())
-
             else {
                 return;
             };
@@ -1237,6 +1292,61 @@ impl SessionsPanel {
             multi_workspace.move_workspace(dragged, target, cx);
         });
         cx.notify();
+    }
+
+    /// Reorders a terminal within its session: the dragged row takes `target`'s
+    /// slot, the same way a dragged session takes another session's place.
+    ///
+    /// A session's rail rows are its panes' items flattened, so a drop that
+    /// crosses a split is a move between panes — `move_item` covers both. It
+    /// never activates: reordering the rail must not pull focus or change
+    /// which terminal is on screen.
+    fn move_terminal(
+        &self,
+        dragged: &DraggedTerminal,
+        target: &Entity<TerminalView>,
+        target_workspace: &Entity<Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The rail reorders within a session only; a row dragged out of
+        // another session is left where it is.
+        if dragged.workspace != *target_workspace || dragged.terminal == *target {
+            return;
+        }
+        let panes = {
+            let workspace = target_workspace.read(cx);
+            let from = Self::pane_and_index(workspace, dragged.terminal.entity_id(), cx);
+            let to = Self::pane_and_index(workspace, target.entity_id(), cx);
+            from.zip(to)
+        };
+        let Some(((from_pane, _), (to_pane, to_index))) = panes else {
+            return;
+        };
+        move_item(
+            &from_pane,
+            &to_pane,
+            dragged.terminal.entity_id(),
+            to_index,
+            false,
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// The pane holding `item_id`, and the item's index within that pane.
+    fn pane_and_index(
+        workspace: &Workspace,
+        item_id: EntityId,
+        cx: &App,
+    ) -> Option<(Entity<Pane>, usize)> {
+        workspace.panes().iter().find_map(|pane| {
+            pane.read(cx)
+                .items()
+                .position(|item| item.item_id() == item_id)
+                .map(|index| (pane.clone(), index))
+        })
     }
 
     /// Makes `workspace` the window's active workspace (swapping the whole
@@ -1320,11 +1430,8 @@ impl Render for SessionsPanel {
                                                     if unseen
                                                         .contains(&terminal_view.entity_id())
                                                     {
-                                                        let title = terminal_view
-                                                            .read(cx)
-                                                            .terminal()
-                                                            .read(cx)
-                                                            .title(true);
+                                                        let title =
+                                                            terminal_title(&terminal_view, cx);
                                                         entries.push((
                                                             format!("{name} · {title}"),
                                                             workspace.clone(),
@@ -1528,15 +1635,17 @@ impl Render for SessionsPanel {
                                 .icon_size(IconSize::XSmall)
                                 .icon_color(Color::Muted)
                                 .tooltip(Tooltip::text("Close Session"))
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_session(
-                                        close_session_workspace.clone(),
-                                        close_session_name.clone(),
-                                        window,
-                                        cx,
-                                    );
-                                })),
+                                .on_click(cx.listener(
+                                    move |this, _event, window, cx| {
+                                        cx.stop_propagation();
+                                        this.close_session(
+                                            close_session_workspace.clone(),
+                                            close_session_name.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
                             ),
                     ),
             );

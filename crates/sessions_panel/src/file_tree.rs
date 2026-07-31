@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 /// can't hang rendering.
 pub const MAX_ENTRIES_PER_DIR: usize = 1000;
 
-// ponytail: const instead of a setting; wire into SettingsContent if someone
-// actually asks to toggle it from the UI.
-const SHOW_HIDDEN: bool = false;
+// ponytail: const skip-list instead of a setting; wire into SettingsContent if
+// someone actually asks to configure it from the UI.
+const HIDDEN_NAMES: &[&str] = &[".git", ".DS_Store"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeEntry {
@@ -50,7 +50,7 @@ pub fn read_dir(dir: &Path) -> DirState {
             Err(_) => continue,
         };
         let name = dir_entry.file_name().to_string_lossy().into_owned();
-        if !SHOW_HIDDEN && name.starts_with('.') {
+        if HIDDEN_NAMES.contains(&name.as_str()) {
             continue;
         }
         if entries.len() >= MAX_ENTRIES_PER_DIR {
@@ -95,16 +95,18 @@ mod tests {
     }
 
     #[test]
-    fn skips_hidden_entries_by_default() {
+    fn shows_dotfiles_but_skips_git_and_ds_store() {
         let dir = tempfile_dir();
-        fs::write(dir.join(".hidden"), b"").unwrap();
+        fs::create_dir(dir.join(".git")).unwrap();
+        fs::write(dir.join(".DS_Store"), b"").unwrap();
+        fs::write(dir.join(".env"), b"").unwrap();
         fs::write(dir.join("visible"), b"").unwrap();
 
         let DirState::Loaded(listing) = read_dir(&dir) else {
             panic!("expected Loaded state");
         };
-        assert_eq!(listing.entries.len(), 1);
-        assert_eq!(listing.entries[0].name, "visible");
+        let names: Vec<&str> = listing.entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec![".env", "visible"]);
     }
 
     #[test]
