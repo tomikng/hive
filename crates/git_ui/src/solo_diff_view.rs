@@ -20,6 +20,7 @@ use multi_buffer::{MultiBuffer, PathKey, excerpt_context_lines};
 use project::{
     Project,
     git_store::{Repository, RepositoryId},
+    image_store::is_image_file,
 };
 use settings::{Settings, SettingsStore, StatusStyle};
 use std::{
@@ -56,7 +57,7 @@ impl SoloDiffView {
         workspace: WeakEntity<Workspace>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Task<Result<Entity<Self>>> {
+    ) -> Task<Result<()>> {
         let Some(workspace_entity) = workspace.upgrade() else {
             return Task::ready(Err(anyhow::anyhow!("workspace was dropped")));
         };
@@ -70,7 +71,7 @@ impl SoloDiffView {
                 workspace.activate_item(&existing, true, true, window, cx);
             });
             existing.focus_handle(cx).focus(window, cx);
-            return Task::ready(Ok(existing));
+            return Task::ready(Ok(()));
         }
 
         let Some(project_path) = repository
@@ -84,6 +85,17 @@ impl SoloDiffView {
         };
 
         let project = workspace_entity.read(cx).project().clone();
+
+        // An image has no text to diff, and `open_buffer` refuses it outright
+        // with "Binary files are not supported". Clicking a changed image means
+        // "show me the image", so hand the path to whichever view claims it.
+        if is_image_file(&project, &project_path, cx) {
+            let opened = workspace_entity.update(cx, |workspace, cx| {
+                workspace.open_path(project_path, None, true, window, cx)
+            });
+            return window.spawn(cx, async move |_| opened.await.map(|_| ()));
+        }
+
         let repo_path = entry.repo_path;
         window.spawn(cx, async move |cx| {
             let buffer = project
@@ -112,8 +124,7 @@ impl SoloDiffView {
                     )
                 });
 
-                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
-                view
+                workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
             })
         })
     }
