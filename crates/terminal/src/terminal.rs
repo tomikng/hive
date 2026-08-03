@@ -2920,6 +2920,17 @@ impl Terminal {
         }
     }
 
+    /// SIGTERMs the command running in the foreground, leaving the shell that
+    /// spawned it alive so the terminal can be reused. Only call this knowing a
+    /// command *is* in the foreground: when the shell itself owns the
+    /// foreground process group, this kills the shell.
+    pub fn terminate_foreground_process(&self) -> bool {
+        match &self.terminal_type {
+            TerminalType::Pty { info, .. } => info.terminate_current_process(),
+            TerminalType::DisplayOnly => false,
+        }
+    }
+
     pub fn pid(&self) -> Option<sysinfo::Pid> {
         match &self.terminal_type {
             TerminalType::Pty { info, .. } => info.pid(),

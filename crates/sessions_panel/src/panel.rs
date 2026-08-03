@@ -124,6 +124,76 @@ fn terminal_title(terminal_view: &Entity<TerminalView>, cx: &App) -> String {
         .unwrap_or_else(|| terminal_view.terminal().read(cx).title(true))
 }
 
+// ponytail: relaunches with the flags Hive picks rather than whatever the user
+// originally typed; read the process argv if that turns out to matter.
+/// `--continue` resumes the conversation that was just interrupted, so the
+/// restart costs the user nothing but the wait.
+const CLAUDE_RESTART_COMMAND: &str = "claude --continue\r";
+const RESTART_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const RESTART_POLL_LIMIT: usize = 50;
+
+/// Restarts Claude Code in place: SIGTERM whatever it's doing, wait for the
+/// shell to take the foreground back, then type the relaunch.
+///
+/// The wait is the whole trick — typed any earlier the command goes into Claude
+/// Code's own prompt, where it dies along with the process. The foreground
+/// process group id is read live off the pty, so it flips as soon as the shell
+/// is back rather than on the panel's next poll.
+fn restart_claude(terminal_view: Entity<TerminalView>, cx: &mut App) {
+    let terminal = terminal_view.read(cx).terminal().clone();
+    let foreground_before = terminal.read(cx).pid();
+    // Whether a command — rather than the shell that spawned it — owns the
+    // pty's foreground. Read live off the pty, because signalling on a stale
+    // "Claude is running" would SIGTERM the user's shell.
+    let shell = terminal
+        .read(cx)
+        .pid_getter()
+        .map(|pid_getter| pid_getter.fallback_pid());
+    if foreground_before.is_none() || foreground_before == shell {
+        // Claude Code has already exited; the prompt is sitting there waiting.
+        terminal.update(cx, |terminal, _| {
+            terminal.input(CLAUDE_RESTART_COMMAND.as_bytes())
+        });
+        return;
+    }
+    if !terminal
+        .read(cx)
+        .foreground_process_command_name()
+        .as_deref()
+        .is_some_and(is_claude_code)
+    {
+        // Something else has the foreground now. Killing whatever the user
+        // started instead is never the right answer to this toast.
+        log::warn!("not restarting: Claude Code is no longer this session's foreground process");
+        return;
+    }
+    if !terminal.read(cx).terminate_foreground_process() {
+        log::warn!("Hive could not signal Claude Code's process to restart it");
+        return;
+    }
+    // Weak, so a terminal the user closes mid-restart is dropped on time and
+    // the loop ends with it rather than typing into a dead session.
+    let terminal = terminal.downgrade();
+    cx.spawn(async move |cx| {
+        for _ in 0..RESTART_POLL_LIMIT {
+            cx.background_executor().timer(RESTART_POLL_INTERVAL).await;
+            let Ok(foreground) = terminal.read_with(cx, |terminal, _| terminal.pid()) else {
+                return; // terminal closed under us
+            };
+            if foreground != foreground_before {
+                terminal
+                    .update(cx, |terminal, _| {
+                        terminal.input(CLAUDE_RESTART_COMMAND.as_bytes())
+                    })
+                    .ok();
+                return;
+            }
+        }
+        log::warn!("Claude Code did not exit; leaving the session alone");
+    })
+    .detach();
+}
+
 /// The session's root: its first visible worktree — the project this session
 /// was opened as — regardless of where its terminals have wandered since.
 fn session_root(workspace: &Workspace, cx: &App) -> Option<PathBuf> {
@@ -353,7 +423,7 @@ impl SessionsPanel {
             }
 
             if foreground.as_deref().is_some_and(is_claude_code) {
-                self.offer_claude_notifications(cx);
+                self.offer_claude_notifications(&terminal_view, cx);
             }
 
             // Auto-title agent sessions: once the agent has run long enough
@@ -545,11 +615,16 @@ impl SessionsPanel {
     /// (see [`crate::claude_settings`]), so the first time an agent runs, offer
     /// to switch it on. Once per window, and never when the user has already
     /// chosen a channel.
-    fn offer_claude_notifications(&mut self, cx: &mut Context<Self>) {
+    fn offer_claude_notifications(
+        &mut self,
+        terminal_view: &Entity<TerminalView>,
+        cx: &mut Context<Self>,
+    ) {
         if self.claude_notify_offered {
             return;
         }
         self.claude_notify_offered = true;
+        let terminal_view = terminal_view.downgrade();
         cx.spawn(async move |this, cx| {
             let configured = cx
                 .background_executor()
@@ -577,6 +652,7 @@ impl SessionsPanel {
                                 // startup, so nothing changes in the session
                                 // that prompted this.
                                 let toast_target = toast_target.clone();
+                                let terminal_view = terminal_view.clone();
                                 cx.spawn(async move |cx| {
                                     let wrote = cx
                                         .background_executor()
@@ -584,18 +660,37 @@ impl SessionsPanel {
                                             claude_settings::enable_notifications().log_err()
                                         })
                                         .await;
-                                    let message = if wrote.is_some() {
-                                        "Claude Code will report its turns to Hive once you restart it."
-                                    } else {
-                                        "Hive could not write Claude Code's settings — see the log."
-                                    };
                                     toast_target
                                         .update(cx, |workspace, cx| {
                                             let id = NotificationId::composite::<Self>(
                                                 "claude-notifications-result",
                                             );
-                                            workspace
-                                                .show_toast(Toast::new(id, message).autohide(), cx);
+                                            let Some(terminal_view) =
+                                                wrote.and(terminal_view.upgrade())
+                                            else {
+                                                let message = if wrote.is_some() {
+                                                    "Claude Code will report its turns to Hive once you restart it."
+                                                } else {
+                                                    "Hive could not write Claude Code's settings — see the log."
+                                                };
+                                                workspace.show_toast(
+                                                    Toast::new(id, message).autohide(),
+                                                    cx,
+                                                );
+                                                return;
+                                            };
+                                            // No autohide: this one is here to be
+                                            // clicked, not just read.
+                                            workspace.show_toast(
+                                                Toast::new(
+                                                    id,
+                                                    "Claude Code reads its settings at startup, so this session won't report its turns yet.",
+                                                )
+                                                .on_click("Restart Claude", move |_window, cx| {
+                                                    restart_claude(terminal_view.clone(), cx);
+                                                }),
+                                                cx,
+                                            );
                                         })
                                         .ok();
                                 })

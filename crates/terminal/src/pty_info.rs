@@ -219,16 +219,35 @@ impl PtyProcessInfo {
     }
 
     #[cfg(unix)]
-    pub(crate) fn kill_current_process(&self) -> bool {
+    fn signal_current_process(&self, signal: i32) -> bool {
         let Some(pid) = self.pid_getter.pid() else {
             return false;
         };
-        unsafe { libc::killpg(pid.as_u32() as i32, libc::SIGKILL) == 0 }
+        unsafe { libc::killpg(pid.as_u32() as i32, signal) == 0 }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn kill_current_process(&self) -> bool {
+        self.signal_current_process(libc::SIGKILL)
+    }
+
+    /// SIGTERM rather than SIGKILL, for a foreground process that is being
+    /// restarted rather than torn down: it gets to flush its state on the way
+    /// out.
+    #[cfg(unix)]
+    pub(crate) fn terminate_current_process(&self) -> bool {
+        self.signal_current_process(libc::SIGTERM)
     }
 
     #[cfg(not(unix))]
     pub(crate) fn kill_current_process(&self) -> bool {
         self.refresh().is_some_and(|process| process.kill())
+    }
+
+    // Windows has no graceful signal to send here; the kill is the terminate.
+    #[cfg(not(unix))]
+    pub(crate) fn terminate_current_process(&self) -> bool {
+        self.kill_current_process()
     }
 
     pub(crate) fn kill_child_process(&self) -> bool {
