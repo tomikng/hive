@@ -3,12 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, Render, WeakEntity, Window, actions, px,
+    AnyElement, App, AsyncWindowContext, ClipboardItem, Context, DismissEvent, Entity,
+    EventEmitter, FocusHandle, Focusable, Pixels, Render, Subscription, WeakEntity, Window,
+    actions, anchored, deferred, px,
 };
 use file_icons::FileIcons;
-use terminal_view::TerminalView;
-use ui::{ListItem, Tooltip, prelude::*};
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
+use ui::{ContextMenu, ListItem, Tooltip, prelude::*};
 use util::ResultExt;
 use workspace::{
     OpenOptions, OpenVisible, Workspace,
@@ -30,6 +31,7 @@ pub struct FileTreePanel {
     last_terminal_cwd: Option<PathBuf>,
     tree_expanded: HashSet<PathBuf>,
     tree_cache: HashMap<PathBuf, DirState>,
+    context_menu: Option<(Entity<ContextMenu>, gpui::Point<Pixels>, Subscription)>,
 }
 
 pub fn init(cx: &mut App) {
@@ -65,6 +67,7 @@ impl FileTreePanel {
                     last_terminal_cwd: None,
                     tree_expanded: HashSet::default(),
                     tree_cache: HashMap::default(),
+                    context_menu: None,
                 }
             })
         })
@@ -278,6 +281,132 @@ impl FileTreePanel {
         rows
     }
 
+    /// Right-click menu for a tree row. Everything that creates or opens
+    /// something works on the row's *directory*: the row itself when it's a
+    /// folder, its parent when it's a file — right-clicking `src/main.rs` and
+    /// asking for a terminal means `src/`.
+    fn deploy_entry_context_menu(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        position: gpui::Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = if is_dir {
+            path.clone()
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone())
+        };
+        let panel = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let relative = self
+            .tree_root
+            .as_ref()
+            .and_then(|root| path.strip_prefix(root).ok())
+            .map(|relative| relative.to_string_lossy().into_owned());
+
+        let context_menu = ContextMenu::build(window, cx, |menu, _window, _cx| {
+            menu.entry("Open Terminal Here", None, {
+                let dir = dir.clone();
+                move |window, cx| {
+                    let Some(workspace) = workspace.upgrade() else {
+                        return;
+                    };
+                    let dir = dir.clone();
+                    workspace.update(cx, |workspace, cx| {
+                        TerminalPanel::add_center_terminal(
+                            workspace,
+                            window,
+                            cx,
+                            move |project, cx| project.create_terminal_shell(Some(dir), cx),
+                        )
+                        .detach_and_log_err(cx);
+                    });
+                }
+            })
+            .entry("Reveal in Finder", None, {
+                let path = path.clone();
+                move |_window, cx| cx.reveal_path(&path)
+            })
+            .separator()
+            .entry("New File…", None, {
+                let dir = dir.clone();
+                let panel = panel.clone();
+                move |_window, cx| {
+                    Self::create_entry(panel.clone(), dir.clone(), false, cx);
+                }
+            })
+            .entry("New Folder…", None, {
+                let dir = dir.clone();
+                let panel = panel.clone();
+                move |_window, cx| {
+                    Self::create_entry(panel.clone(), dir.clone(), true, cx);
+                }
+            })
+            .separator()
+            .entry("Copy Path", None, {
+                let full_path = path.to_string_lossy().into_owned();
+                move |_window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(full_path.clone()))
+                }
+            })
+            .when_some(relative, |menu, relative| {
+                menu.entry("Copy Relative Path", None, move |_window, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()))
+                })
+            })
+        });
+
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription =
+            cx.subscribe_in(&context_menu, window, |this, _, _: &DismissEvent, _, cx| {
+                this.context_menu.take();
+                cx.notify();
+            });
+        self.context_menu = Some((context_menu, position, subscription));
+        cx.notify();
+    }
+
+    // ponytail: the native save panel does the naming, so the tree needs no
+    // inline editor; swap in one if picking a name in a dialog gets tiring.
+    /// Asks for a name, creates the file or folder, and shows it in the tree.
+    fn create_entry(panel: WeakEntity<Self>, dir: PathBuf, is_dir: bool, cx: &mut App) {
+        let prompt = cx.prompt_for_new_path(&dir, None);
+        cx.spawn(async move |cx| {
+            let Ok(Ok(Some(path))) = prompt.await else {
+                return; // cancelled, or no picker available
+            };
+            let created = cx
+                .background_spawn({
+                    let path = path.clone();
+                    async move {
+                        if is_dir {
+                            std::fs::create_dir_all(&path)
+                        } else {
+                            // Never truncate: the picker already warned about
+                            // replacing an existing file, but it can't know the
+                            // user meant "new file", not "empty that one".
+                            std::fs::OpenOptions::new()
+                                .write(true)
+                                .create_new(true)
+                                .open(&path)
+                                .map(drop)
+                        }
+                    }
+                })
+                .await
+                .log_err();
+            if created.is_none() {
+                return;
+            }
+            panel
+                .update(cx, |panel, cx| panel.refresh_tree(cx))
+                .log_err();
+        })
+        .detach();
+    }
+
     fn render_entry_row(&self, entry: &TreeEntry, depth: usize, cx: &Context<Self>) -> impl IntoElement {
         let path = entry.path.clone();
         let is_dir = entry.is_dir;
@@ -306,6 +435,19 @@ impl FileTreePanel {
             .indent_level(depth)
             .start_slot(icon)
             .child(Label::new(entry.name.clone()).single_line())
+            .on_secondary_mouse_down(cx.listener({
+                let path = entry.path.clone();
+                move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.deploy_entry_context_menu(
+                        path.clone(),
+                        is_dir,
+                        event.position,
+                        window,
+                        cx,
+                    );
+                }
+            }))
             .on_click(cx.listener(move |this, _event, window, cx| {
                 if is_dir {
                     this.toggle_dir(path.clone(), cx);
@@ -334,7 +476,15 @@ impl Render for FileTreePanel {
         if let Some(tree) = self.render_tree(cx) {
             root = root.child(tree);
         }
-        root
+        root.children(self.context_menu.as_ref().map(|(menu, position, _)| {
+            deferred(
+                anchored()
+                    .position(*position)
+                    .anchor(gpui::Anchor::TopLeft)
+                    .child(menu.clone()),
+            )
+            .with_priority(1)
+        }))
     }
 }
 
